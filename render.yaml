@@ -1,0 +1,31 @@
+# إعداد Render (Blueprint): ينشئ خدمة الويب مع قرص دائم للبيانات.
+# في Render: New → Blueprint → اختر هذا المستودع. سيطلب منك قيم ADMIN_USERNAME و ADMIN_PASSWORD.
+services:
+  - type: web
+    name: attendance
+    runtime: docker
+    plan: starter
+    region: frankfurt
+    healthCheckPath: /api/health
+    autoDeploy: true
+    disk:
+      name: attendance-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: TRUST_PROXY
+        value: "1"
+      - key: DB_PATH
+        value: /data/attendance.db
+      - key: ADMIN_NAME
+        value: علي عودة
+      - key: COMPANY_1_NAME
+        value: شركة التيسير
+      - key: COMPANY_2_NAME
+        value: اتحاد مقاولين المياه
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false

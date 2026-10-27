@@ -1,0 +1,22 @@
+# تشغيل على خادم (VPS) مع HTTPS تلقائي عبر Caddy.
+# 1) وجّه نطاقك (مثل attendance.example.com) إلى IP الخادم.
+# 2) ضع النطاق في Caddyfile، واملأ .env، ثم: docker compose up -d --build
+services:
+  app:
+    build: .
+    env_file: .env
+    volumes:
+      - attendance-data:/data
+    restart: unless-stopped
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    restart: unless-stopped
+volumes:
+  attendance-data:
+  caddy-data:
