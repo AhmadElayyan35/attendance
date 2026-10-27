@@ -10,18 +10,23 @@ const { hashPassword } = require('../src/passwords');
 const T = require('../src/time');
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'attendance-test-'));
-const db = openDb(path.join(dir, 'test.db'));
+const fileUrl = (p) => 'file:' + p.split(path.sep).join('/');
+let db;
 let base, server;
 const LOC = { lat: 31.5326, lng: 35.0998, accuracy: 12.4 };
 
 test.before(async () => {
-  db.prepare(`INSERT INTO users (username, password_hash, full_name, role, created_at) VALUES ('boss', ?, 'المدير', 'manager', ?)`)
-    .run(hashPassword('boss-pass-123'), new Date().toISOString());
+  db = await openDb(fileUrl(path.join(dir, 'test.db')));
+  await db.run(`INSERT INTO users (username, password_hash, full_name, role, created_at) VALUES ('boss', ?, 'المدير', 'manager', ?)`,
+    hashPassword('boss-pass-123'), new Date().toISOString());
   server = createApp(db).listen(0);
   await new Promise((r) => server.once('listening', r));
   base = `http://127.0.0.1:${server.address().port}`;
 });
-test.after(() => { server.close(); db.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+test.after(() => {
+  server.close(); db.close();
+  try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows قد يُبقي الملف مقفلًا لحظة */ }
+});
 
 async function call(method, url, { cookie, body, headers = {} } = {}) {
   const res = await fetch(base + url, {
@@ -89,7 +94,7 @@ test('missing or invalid location saves nothing', async () => {
   for (const body of [{}, { lat: 31, lng: 35 }, { lat: 'x', lng: 35, accuracy: 5 }, { lat: 91, lng: 35, accuracy: 5 }]) {
     assert.equal((await call('POST', '/api/my/check-in', { cookie: emp1, body })).status, 400);
   }
-  assert.equal(db.prepare('SELECT COUNT(*) n FROM attendance').get().n, 0);
+  assert.equal((await db.get('SELECT COUNT(*) n FROM attendance')).n, 0);
 });
 
 test('check-in uses server time and own company; client cannot override', async () => {
@@ -100,7 +105,7 @@ test('check-in uses server time and own company; client cannot override', async 
   assert.ok(t >= before - 1000 && t <= Date.now() + 1000, 'server time used');
   assert.equal(r.json.record.user_id, emp1Id);
   assert.equal(r.json.record.company_id, 1);
-  assert.equal(db.prepare('SELECT in_accuracy FROM attendance WHERE id = ?').get(r.json.record.id).in_accuracy, 12.4, 'accuracy stored for the manager');
+  assert.equal((await db.get('SELECT in_accuracy FROM attendance WHERE id = ?', r.json.record.id)).in_accuracy, 12.4, 'accuracy stored for the manager');
   assert.equal(r.json.record.status, 'open');
   const me = await call('GET', '/api/me', { cookie: emp1 });
   assert.equal(me.json.open_record.id, r.json.record.id);
@@ -111,7 +116,7 @@ test('concurrent duplicate check-ins create exactly one open record', async () =
   const codes = results.map((r) => r.status).sort();
   assert.equal(codes.filter((c) => c === 201).length, 1, codes.join(','));
   assert.equal(codes.filter((c) => c === 409).length, 7);
-  assert.equal(db.prepare('SELECT COUNT(*) n FROM attendance WHERE user_id = ? AND check_out_at IS NULL').get(emp2Id).n, 1);
+  assert.equal((await db.get('SELECT COUNT(*) n FROM attendance WHERE user_id = ? AND check_out_at IS NULL', emp2Id)).n, 1);
 });
 
 test('concurrent check-outs close the record exactly once', async () => {
@@ -119,12 +124,12 @@ test('concurrent check-outs close the record exactly once', async () => {
   assert.equal(results.filter((r) => r.status === 200).length, 1);
   const ok = results.find((r) => r.status === 200).json.record;
   assert.equal(ok.status, 'completed');
-  assert.equal(db.prepare('SELECT out_accuracy FROM attendance WHERE id = ?').get(ok.id).out_accuracy, 250);
+  assert.equal((await db.get('SELECT out_accuracy FROM attendance WHERE id = ?', ok.id)).out_accuracy, 250);
   assert.ok(ok.check_out_at >= ok.check_in_at);
   // جلسة ثانية في اليوم نفسه مسموحة
   assert.equal((await call('POST', '/api/my/check-in', { cookie: emp2, body: LOC })).status, 201);
   assert.equal((await call('POST', '/api/my/check-out', { cookie: emp2, body: LOC })).status, 200);
-  assert.equal(db.prepare('SELECT COUNT(*) n FROM attendance WHERE user_id = ?').get(emp2Id).n, 2);
+  assert.equal((await db.get('SELECT COUNT(*) n FROM attendance WHERE user_id = ?', emp2Id)).n, 2);
 });
 
 test('employees see only their own records', async () => {
@@ -134,27 +139,26 @@ test('employees see only their own records', async () => {
   assert.ok(r2.json.records.length === 2 && r2.json.records.every((r) => r.user_id === emp2Id));
 });
 
-test('database rejects edits, deletes and a second open record', () => {
-  const done = db.prepare('SELECT * FROM attendance WHERE check_out_at IS NOT NULL LIMIT 1').get();
-  assert.throws(() => db.prepare('UPDATE attendance SET check_out_at = ? WHERE id = ?').run('2030-01-01T00:00:00.000Z', done.id), /immutable/);
-  assert.throws(() => db.prepare('DELETE FROM attendance WHERE id = ?').run(done.id), /cannot be deleted/);
-  const open = db.prepare('SELECT * FROM attendance WHERE check_out_at IS NULL LIMIT 1').get();
-  assert.throws(() => db.prepare('UPDATE attendance SET check_in_at = ? WHERE id = ?').run('2020-01-01T00:00:00.000Z', open.id), /immutable/);
-  assert.throws(() => db.prepare('INSERT INTO attendance (user_id, company_id, check_in_at, in_lat, in_lng, in_accuracy) VALUES (?, 1, ?, 1, 1, 1)')
-    .run(open.user_id, new Date().toISOString()), /UNIQUE/);
-  assert.throws(() => db.prepare('INSERT INTO attendance (user_id, company_id, check_in_at, in_lat, in_lng, in_accuracy) VALUES (?, 1, ?, 1, 1, 1)')
-    .run(emp2Id, new Date().toISOString()), /active employee of this company/, 'wrong company');
-  assert.throws(() => db.prepare('DELETE FROM users WHERE id = ?').run(emp1Id), /deactivate/);
+test('database rejects edits, deletes and a second open record', async () => {
+  const done = (await db.get('SELECT * FROM attendance WHERE check_out_at IS NOT NULL LIMIT 1'));
+  await assert.rejects(db.run('UPDATE attendance SET check_out_at = ? WHERE id = ?', '2030-01-01T00:00:00.000Z', done.id), /immutable/);
+  await assert.rejects(db.run('DELETE FROM attendance WHERE id = ?', done.id), /cannot be deleted/);
+  const open = (await db.get('SELECT * FROM attendance WHERE check_out_at IS NULL LIMIT 1'));
+  await assert.rejects(db.run('UPDATE attendance SET check_in_at = ? WHERE id = ?', '2020-01-01T00:00:00.000Z', open.id), /immutable/);
+  const insert = 'INSERT INTO attendance (user_id, company_id, check_in_at, in_lat, in_lng, in_accuracy) VALUES (?, 1, ?, 1, 1, 1)';
+  await assert.rejects(db.run(insert, open.user_id, new Date().toISOString()), /UNIQUE/);
+  await assert.rejects(db.run(insert, emp2Id, new Date().toISOString()), /active employee of this company/, 'wrong company');
+  await assert.rejects(db.run('DELETE FROM users WHERE id = ?', emp1Id), /deactivate/);
 });
 
 test('duration across midnight, Hebron dates, and totals exclude open records', async () => {
   // سجلات تاريخية تُدخل مباشرة (وقت شتوي: Asia/Hebron = UTC+2)
-  const ins = db.prepare('INSERT INTO attendance (user_id, company_id, check_in_at, in_lat, in_lng, in_accuracy) VALUES (?, ?, ?, 31.5, 35.1, 8)');
-  const close = db.prepare('UPDATE attendance SET check_out_at = ?, out_lat = 31.5, out_lng = 35.1, out_accuracy = 9 WHERE id = ?');
+  const ins = async (...a) => (await db.run('INSERT INTO attendance (user_id, company_id, check_in_at, in_lat, in_lng, in_accuracy) VALUES (?, ?, ?, 31.5, 35.1, 8)', ...a)).lastInsertRowid;
+  const close = (...a) => db.run('UPDATE attendance SET check_out_at = ?, out_lat = 31.5, out_lng = 35.1, out_accuracy = 9 WHERE id = ?', ...a);
   // 2026-01-14 21:30 محليًا → 2026-01-15 02:15 محليًا = 4س 45د
-  const a = ins.run(emp2Id, 2, '2026-01-14T19:30:00.000Z').lastInsertRowid; close.run('2026-01-15T00:15:00.000Z', a);
+  const a = await ins(emp2Id, 2, '2026-01-14T19:30:00.000Z'); await close('2026-01-15T00:15:00.000Z', a);
   // 2026-01-15 00:30 محليًا (ما زال 14 يناير بتوقيت UTC) → 08:00 = 7س 30د
-  const b = ins.run(emp2Id, 2, '2026-01-14T22:30:00.000Z').lastInsertRowid; close.run('2026-01-15T06:00:00.000Z', b);
+  const b = await ins(emp2Id, 2, '2026-01-14T22:30:00.000Z'); await close('2026-01-15T06:00:00.000Z', b);
 
   assert.equal(T.durationMinutes('2026-01-14T19:30:00.000Z', '2026-01-15T00:15:00.000Z'), 285);
   assert.equal(T.localDate('2026-01-14T22:30:00.000Z'), '2026-01-15');
@@ -240,20 +244,20 @@ test('multiple managers: add, both see everything, safe deactivation', async () 
   assert.equal((await call('PATCH', `/api/admin/users/${boss2Id}`, { cookie: mgr, body: { active: false } })).status, 200);
   assert.equal((await call('GET', '/api/admin/overview', { cookie: mgr2 })).status, 401);
   // المدير الوحيد المتبقي لا يمكن إيقافه
-  const bossId = db.prepare("SELECT id FROM users WHERE username = 'boss'").get().id;
+  const bossId = (await db.get("SELECT id FROM users WHERE username = 'boss'")).id;
   assert.equal((await call('PATCH', `/api/admin/users/${bossId}`, { cookie: mgr, body: { active: false } })).status, 400);
   // موظف لا يستطيع إنشاء مدير
   assert.equal((await call('POST', '/api/admin/users', { cookie: emp1, body: { role: 'manager', full_name: 'x', username: 'hack', password: 'hack-pass-1' } })).status, 403);
 });
 
-test('daily backup creates a readable copy and prunes old ones', () => {
+test('daily backup creates a readable copy and prunes old ones', async () => {
   const { backupDb } = require('../src/db');
   const bdir = path.join(dir, 'backups');
   fs.mkdirSync(bdir, { recursive: true });
   for (const d of ['2020-01-01', '2020-01-02', '2020-01-03']) fs.writeFileSync(path.join(bdir, `attendance-${d}.db`), '');
-  const file = backupDb(db, bdir, 2);
-  const copy = openDb(file);
-  assert.ok(copy.prepare('SELECT COUNT(*) n FROM attendance').get().n > 0);
+  const file = await backupDb(db, bdir, 2);
+  const copy = await openDb(fileUrl(file));
+  assert.ok((await copy.get('SELECT COUNT(*) n FROM attendance')).n > 0);
   copy.close();
   assert.deepEqual(fs.readdirSync(bdir).filter((f) => f.endsWith('.db')).sort(), ['attendance-2020-01-03.db', path.basename(file)]);
 });

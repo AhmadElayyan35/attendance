@@ -1,10 +1,10 @@
 'use strict';
-// قاعدة البيانات: SQLite المدمجة في Node (node:sqlite) — ملف دائم على القرص.
+// قاعدة البيانات: SQLite عبر libSQL — ملف محلي (file:...) أو قاعدة سحابية على Turso (libsql://...).
 // القيود الأساسية مفروضة داخل قاعدة البيانات نفسها (قيود CHECK، فهرس فريد جزئي، ومشغّلات triggers)
 // حتى لو تجاوز أحدٌ منطق الخادم.
 const fs = require('node:fs');
 const path = require('node:path');
-const { DatabaseSync } = require('node:sqlite');
+const { createClient } = require('@libsql/client');
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS companies (
@@ -90,50 +90,76 @@ BEGIN
 END;
 `;
 
-// ترحيلات مرقّمة (PRAGMA user_version). أضف أي تغيير مستقبلي في الجدول كعنصر جديد في آخر القائمة.
+// ترحيلات مرقّمة. أضف أي تغيير مستقبلي في الجداول كعنصر جديد (قائمة جمل SQL) في آخر القائمة.
 const MIGRATIONS = [
   // 1: شعار لكل شركة
-  `ALTER TABLE companies ADD COLUMN logo TEXT;
-   UPDATE companies SET logo = 'company-' || id || '.png' WHERE id IN (1, 2) AND logo IS NULL;`,
+  [
+    'ALTER TABLE companies ADD COLUMN logo TEXT',
+    "UPDATE companies SET logo = 'company-' || id || '.png' WHERE id IN (1, 2) AND logo IS NULL",
+  ],
 ];
 
-function migrate(db) {
-  let version = db.prepare('PRAGMA user_version').get().user_version;
-  for (; version < MIGRATIONS.length; version++) {
-    db.exec('BEGIN');
-    try {
-      db.exec(MIGRATIONS[version]);
-      db.exec(`PRAGMA user_version = ${version + 1}`);
-      db.exec('COMMIT');
-    } catch (e) {
-      db.exec('ROLLBACK');
-      throw e;
-    }
+// غلاف بسيط يعيد صفوفًا كائنات عادية.
+function wrap(client, url) {
+  const toObjects = (r) => r.rows.map((row) => Object.fromEntries(r.columns.map((c, i) => [c, row[i]])));
+  return {
+    url,
+    isLocalFile: url.startsWith('file:'),
+    async get(sql, ...args) { return toObjects(await client.execute({ sql, args }))[0]; },
+    async all(sql, ...args) { return toObjects(await client.execute({ sql, args })); },
+    async run(sql, ...args) {
+      const r = await client.execute({ sql, args });
+      return { changes: r.rowsAffected, lastInsertRowid: r.lastInsertRowid == null ? null : Number(r.lastInsertRowid) };
+    },
+    exec(sql) { return client.executeMultiple(sql); },
+    batch(statements) { return client.batch(statements, 'write'); },
+    close() { client.close(); },
+  };
+}
+
+async function migrate(db) {
+  await db.exec('CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)');
+  let row = await db.get('SELECT version FROM schema_version');
+  if (!row) {
+    // قواعد بيانات أنشأتها نسخ سابقة كانت تحفظ الرقم في PRAGMA user_version
+    let legacy = 0;
+    try { legacy = (await db.get('PRAGMA user_version'))?.user_version || 0; } catch { /* غير مدعوم */ }
+    await db.run('INSERT INTO schema_version (version) VALUES (?)', legacy);
+    row = { version: legacy };
+  }
+  for (let v = row.version; v < MIGRATIONS.length; v++) {
+    // كل ترحيل يُطبّق كاملًا أو لا يُطبّق (معاملة واحدة)
+    await db.batch([...MIGRATIONS[v], { sql: 'UPDATE schema_version SET version = ?', args: [v + 1] }]);
   }
 }
 
-function openDb(dbPath) {
-  if (dbPath !== ':memory:') fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
-  const db = new DatabaseSync(dbPath);
-  db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
-  db.exec(SCHEMA);
-
-  const count = db.prepare('SELECT COUNT(*) AS n FROM companies').get().n;
-  if (count === 0) {
-    const ins = db.prepare('INSERT INTO companies (name) VALUES (?)');
-    ins.run(process.env.COMPANY_1_NAME || 'شركة التيسير');
-    ins.run(process.env.COMPANY_2_NAME || 'اتحاد مقاولين المياه');
+// url: "file:./data/attendance.db" أو "libsql://<db>.turso.io" (مع authToken)
+async function openDb(url, authToken) {
+  if (url.startsWith('file:')) {
+    const file = url.slice('file:'.length);
+    if (file !== ':memory:') fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
   }
-  migrate(db);
+  const db = wrap(createClient({ url, authToken }), url);
+  if (db.isLocalFile) await db.exec('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
+  await db.exec('PRAGMA foreign_keys = ON;');
+  await db.exec(SCHEMA);
+
+  const count = (await db.get('SELECT COUNT(*) AS n FROM companies')).n;
+  if (count === 0) {
+    await db.run('INSERT INTO companies (name) VALUES (?)', process.env.COMPANY_1_NAME || 'شركة التيسير');
+    await db.run('INSERT INTO companies (name) VALUES (?)', process.env.COMPANY_2_NAME || 'اتحاد مقاولين المياه');
+  }
+  await migrate(db);
   return db;
 }
 
-// نسخة احتياطية يومية متسقة (VACUUM INTO) مع الاحتفاظ بآخر `keep` نسخة.
-function backupDb(db, dir, keep = 14) {
+// نسخة احتياطية يومية متسقة (VACUUM INTO) لقاعدة البيانات المحلية، مع الاحتفاظ بآخر `keep` نسخة.
+// قاعدة Turso السحابية لها استرجاع زمني خاص بها، فلا تحتاج هذا.
+async function backupDb(db, dir, keep = 14) {
   fs.mkdirSync(dir, { recursive: true });
   const stamp = new Date().toISOString().slice(0, 10);
   const file = path.join(dir, `attendance-${stamp}.db`);
-  if (!fs.existsSync(file)) db.exec(`VACUUM INTO '${file.replace(/'/g, "''")}'`);
+  if (!fs.existsSync(file)) await db.exec(`VACUUM INTO '${file.replace(/'/g, "''")}'`);
   const old = fs.readdirSync(dir).filter((f) => /^attendance-\d{4}-\d{2}-\d{2}\.db$/.test(f)).sort().slice(0, -keep);
   for (const f of old) fs.rmSync(path.join(dir, f));
   return file;

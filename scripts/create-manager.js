@@ -3,6 +3,7 @@
 // الاستخدام: npm run create-manager
 const readline = require('node:readline');
 const { openDb } = require('../src/db');
+const { databaseConfig } = require('../src/config');
 const { hashPassword, validatePassword } = require('../src/passwords');
 
 (async () => {
@@ -17,18 +18,18 @@ const { hashPassword, validatePassword } = require('../src/passwords');
   const err = validatePassword(password);
   if (err) { console.error('Password must be at least 8 characters'); process.exit(1); }
 
-  const db = openDb(process.env.DB_PATH || './data/attendance.db');
-  const existing = db.prepare('SELECT id, role FROM users WHERE username = ?').get(username);
+  const cfg = databaseConfig();
+  const db = await openDb(cfg.url, cfg.authToken);
+  const existing = await db.get('SELECT id, role FROM users WHERE username = ?', username);
   if (existing && existing.role !== 'manager') { console.error('That username belongs to an employee'); process.exit(1); }
   if (existing) {
-    db.prepare('UPDATE users SET password_hash = ?, full_name = ?, active = 1 WHERE id = ?')
-      .run(hashPassword(password), fullName, existing.id);
-    db.prepare('DELETE FROM sessions WHERE user_id = ?').run(existing.id);
+    await db.run('UPDATE users SET password_hash = ?, full_name = ?, active = 1 WHERE id = ?', hashPassword(password), fullName, existing.id);
+    await db.run('DELETE FROM sessions WHERE user_id = ?', existing.id);
     console.log(`Updated manager "${username}".`);
   } else {
-    db.prepare(`INSERT INTO users (username, password_hash, full_name, role, created_at)
-                VALUES (?, ?, ?, 'manager', ?)`)
-      .run(username, hashPassword(password), fullName, new Date().toISOString());
+    await db.run(`INSERT INTO users (username, password_hash, full_name, role, created_at)
+                  VALUES (?, ?, ?, 'manager', ?)`, username, hashPassword(password), fullName, new Date().toISOString());
     console.log(`Created manager "${username}".`);
   }
+  db.close();
 })();

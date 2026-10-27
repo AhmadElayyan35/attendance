@@ -18,29 +18,40 @@ function createApp(db, opts = {}) {
   app.disable('x-powered-by');
   if (opts.trustProxy) app.set('trust proxy', opts.trustProxy);
 
+  // يمرّر أخطاء المعالجات غير المتزامنة إلى معالج الأخطاء (Express 4 لا يفعل ذلك تلقائيًا).
+  for (const method of ['get', 'post', 'patch', 'use']) {
+    const original = app[method].bind(app);
+    app[method] = (...args) => {
+      if (method === 'get' && args.length === 1) return original(...args); // app.get('setting')
+      return original(...args.map((fn) => (typeof fn === 'function' && fn.constructor.name === 'AsyncFunction'
+        ? (req, res, next) => fn(req, res, next).catch(next)
+        : fn)));
+    };
+  }
+
   const q = {
-    sessionUser: db.prepare(`
+    sessionUser: `
       SELECT u.id, u.username, u.full_name, u.role, u.company_id, c.name AS company_name, c.logo AS company_logo
       FROM sessions s JOIN users u ON u.id = s.user_id LEFT JOIN companies c ON c.id = u.company_id
-      WHERE s.token_hash = ? AND s.expires_at > ? AND u.active = 1`),
-    insertSession: db.prepare('INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)'),
-    deleteSession: db.prepare('DELETE FROM sessions WHERE token_hash = ?'),
-    deleteUserSessions: db.prepare('DELETE FROM sessions WHERE user_id = ?'),
-    deleteExpired: db.prepare('DELETE FROM sessions WHERE expires_at <= ?'),
-    userByName: db.prepare('SELECT * FROM users WHERE username = ?'),
-    userById: db.prepare('SELECT * FROM users WHERE id = ?'),
-    activeManagers: db.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'manager' AND active = 1"),
-    openRecord: db.prepare('SELECT * FROM attendance WHERE user_id = ? AND check_out_at IS NULL'),
-    checkIn: db.prepare(`INSERT INTO attendance (user_id, company_id, check_in_at, in_lat, in_lng, in_accuracy)
-                         VALUES (?, ?, ?, ?, ?, ?)`),
-    checkOut: db.prepare(`UPDATE attendance SET check_out_at = ?, out_lat = ?, out_lng = ?, out_accuracy = ?
-                          WHERE user_id = ? AND check_out_at IS NULL`),
-    recordById: db.prepare('SELECT * FROM attendance WHERE id = ?'),
-    myRecords: db.prepare('SELECT * FROM attendance WHERE user_id = ? ORDER BY check_in_at DESC LIMIT ?'),
-    companies: db.prepare('SELECT id, name, logo FROM companies ORDER BY id'),
-    companyById: db.prepare('SELECT id FROM companies WHERE id = ?'),
-    renameCompany: db.prepare('UPDATE companies SET name = ? WHERE id = ?'),
-    employees: db.prepare(`
+      WHERE s.token_hash = ? AND s.expires_at > ? AND u.active = 1`,
+    insertSession: 'INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)',
+    deleteSession: 'DELETE FROM sessions WHERE token_hash = ?',
+    deleteUserSessions: 'DELETE FROM sessions WHERE user_id = ?',
+    deleteExpired: 'DELETE FROM sessions WHERE expires_at <= ?',
+    userByName: 'SELECT * FROM users WHERE username = ?',
+    userById: 'SELECT * FROM users WHERE id = ?',
+    activeManagers: "SELECT COUNT(*) AS n FROM users WHERE role = 'manager' AND active = 1",
+    openRecord: 'SELECT * FROM attendance WHERE user_id = ? AND check_out_at IS NULL',
+    checkIn: `INSERT INTO attendance (user_id, company_id, check_in_at, in_lat, in_lng, in_accuracy)
+                         VALUES (?, ?, ?, ?, ?, ?)`,
+    checkOut: `UPDATE attendance SET check_out_at = ?, out_lat = ?, out_lng = ?, out_accuracy = ?
+                          WHERE user_id = ? AND check_out_at IS NULL`,
+    recordById: 'SELECT * FROM attendance WHERE id = ?',
+    myRecords: 'SELECT * FROM attendance WHERE user_id = ? ORDER BY check_in_at DESC LIMIT ?',
+    companies: 'SELECT id, name, logo FROM companies ORDER BY id',
+    companyById: 'SELECT id FROM companies WHERE id = ?',
+    renameCompany: 'UPDATE companies SET name = ? WHERE id = ?',
+    employees: `
       SELECT u.id, u.username, u.full_name, u.company_id, c.name AS company_name, c.logo AS company_logo, u.active,
              a.id AS open_id, a.check_in_at AS open_check_in_at, a.in_lat AS open_in_lat,
              a.in_lng AS open_in_lng, a.in_accuracy AS open_in_accuracy,
@@ -48,12 +59,12 @@ function createApp(db, opts = {}) {
       FROM users u JOIN companies c ON c.id = u.company_id
       LEFT JOIN attendance a ON a.user_id = u.id AND a.check_out_at IS NULL
       WHERE u.role = 'employee'
-      ORDER BY u.active DESC, c.id, u.full_name`),
-    managers: db.prepare(`SELECT id, username, full_name, active, created_at FROM users
-                          WHERE role = 'manager' ORDER BY active DESC, full_name`),
-    insertUser: db.prepare(`INSERT INTO users (username, password_hash, full_name, role, company_id, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?)`),
-    updatePassword: db.prepare('UPDATE users SET password_hash = ? WHERE id = ?'),
+      ORDER BY u.active DESC, c.id, u.full_name`,
+    managers: `SELECT id, username, full_name, active, created_at FROM users
+                          WHERE role = 'manager' ORDER BY active DESC, full_name`,
+    insertUser: `INSERT INTO users (username, password_hash, full_name, role, company_id, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?)`,
+    updatePassword: 'UPDATE users SET password_hash = ? WHERE id = ?',
   };
 
   // ---------- أمان عام ----------
@@ -69,8 +80,8 @@ function createApp(db, opts = {}) {
     next();
   });
 
-  app.get('/api/health', (req, res) => {
-    db.prepare('SELECT 1').get();
+  app.get('/api/health', async (req, res) => {
+    await db.get('SELECT 1');
     res.json({ ok: true });
   });
 
@@ -90,11 +101,11 @@ function createApp(db, opts = {}) {
     next();
   });
 
-  app.use('/api', (req, res, next) => {
+  app.use('/api', async (req, res, next) => {
     res.set('Cache-Control', 'no-store');
     const token = readCookie(req, COOKIE);
     if (token) {
-      req.user = q.sessionUser.get(sha256(token), new Date().toISOString()) || null;
+      req.user = await db.get(q.sessionUser, sha256(token), new Date().toISOString()) || null;
       req.sessionToken = token;
     }
     next();
@@ -120,7 +131,7 @@ function createApp(db, opts = {}) {
     else a.count++;
   }
 
-  app.post('/api/login', (req, res) => {
+  app.post('/api/login', async (req, res) => {
     const username = String(req.body?.username || '').trim();
     const password = String(req.body?.password || '');
     const ipKey = `ip:${req.ip}`;
@@ -128,7 +139,7 @@ function createApp(db, opts = {}) {
     if (tooMany(ipKey, 50) || tooMany(userKey, 8)) {
       return fail(res, 429, 'محاولات كثيرة. حاول مرة أخرى بعد 15 دقيقة');
     }
-    const user = username ? q.userByName.get(username) : null;
+    const user = username ? await db.get(q.userByName, username) : null;
     const ok = verifyPassword(password, user ? user.password_hash : DUMMY_HASH);
     if (!user || !ok) {
       recordFail(ipKey); recordFail(userKey);
@@ -138,28 +149,28 @@ function createApp(db, opts = {}) {
     attempts.delete(userKey);
 
     const now = new Date();
-    q.deleteExpired.run(now.toISOString());
+    await db.run(q.deleteExpired, now.toISOString());
     const token = crypto.randomBytes(32).toString('base64url');
     const expires = new Date(now.getTime() + SESSION_DAYS * 864e5);
-    q.insertSession.run(sha256(token), user.id, now.toISOString(), expires.toISOString());
+    await db.run(q.insertSession, sha256(token), user.id, now.toISOString(), expires.toISOString());
     res.cookie(COOKIE, token, {
       httpOnly: true, secure: secureCookie, sameSite: 'lax', path: '/', expires,
     });
     res.json({ ok: true, role: user.role });
   });
 
-  app.post('/api/logout', (req, res) => {
-    if (req.sessionToken) q.deleteSession.run(sha256(req.sessionToken));
+  app.post('/api/logout', async (req, res) => {
+    if (req.sessionToken) await db.run(q.deleteSession, sha256(req.sessionToken));
     res.clearCookie(COOKIE, { path: '/' });
     res.json({ ok: true });
   });
 
   // الشعارات والأسماء متاحة لصفحة الدخول.
-  app.get('/api/companies', (req, res) => res.json({ companies: q.companies.all() }));
+  app.get('/api/companies', async (req, res) => res.json({ companies: await db.all(q.companies) }));
 
-  app.get('/api/me', (req, res) => {
+  app.get('/api/me', async (req, res) => {
     if (!req.user) return fail(res, 401, 'يرجى تسجيل الدخول');
-    const open = req.user.role === 'employee' ? q.openRecord.get(req.user.id) : null;
+    const open = req.user.role === 'employee' ? await db.get(q.openRecord, req.user.id) : null;
     res.json({
       user: req.user,
       open_record: open ? employeeView(open) : null,
@@ -169,58 +180,58 @@ function createApp(db, opts = {}) {
     });
   });
 
-  app.post('/api/me/password', (req, res) => {
+  app.post('/api/me/password', async (req, res) => {
     if (!req.user) return fail(res, 401, 'يرجى تسجيل الدخول');
     const { current, next: nextPw } = req.body || {};
-    const row = q.userById.get(req.user.id);
+    const row = await db.get(q.userById, req.user.id);
     if (!verifyPassword(String(current || ''), row.password_hash)) return fail(res, 400, 'كلمة المرور الحالية غير صحيحة');
     const err = validatePassword(nextPw);
     if (err) return fail(res, 400, err);
-    q.updatePassword.run(hashPassword(nextPw), req.user.id);
+    await db.run(q.updatePassword, hashPassword(nextPw), req.user.id);
     res.json({ ok: true });
   });
 
   // ---------- الموظف (يرى أوقات دخوله وخروجه فقط؛ التفاصيل للإدارة) ----------
   const employee = requireRole('employee');
 
-  app.post('/api/my/check-in', employee, (req, res) => {
+  app.post('/api/my/check-in', employee, async (req, res) => {
     const loc = parseLocation(req.body);
     if (loc.error) return fail(res, 400, loc.error);
     const now = new Date().toISOString(); // وقت الخادم هو المرجع الرسمي
     try {
-      const r = q.checkIn.run(req.user.id, req.user.company_id, now, loc.lat, loc.lng, loc.accuracy);
-      res.status(201).json({ ok: true, record: employeeView(q.recordById.get(r.lastInsertRowid)) });
+      const r = await db.run(q.checkIn, req.user.id, req.user.company_id, now, loc.lat, loc.lng, loc.accuracy);
+      res.status(201).json({ ok: true, record: employeeView(await db.get(q.recordById, r.lastInsertRowid)) });
     } catch (e) {
       if (/UNIQUE/i.test(e.message)) return fail(res, 409, 'دوامك مسجّل بالفعل. سجّل خروجك أولًا');
       throw e;
     }
   });
 
-  app.post('/api/my/check-out', employee, (req, res) => {
+  app.post('/api/my/check-out', employee, async (req, res) => {
     const loc = parseLocation(req.body);
     if (loc.error) return fail(res, 400, loc.error);
-    const open = q.openRecord.get(req.user.id);
+    const open = await db.get(q.openRecord, req.user.id);
     if (!open) return fail(res, 409, 'لم تسجّل دخولك بعد');
     const now = new Date().toISOString();
     // التحديث مشروط بأن يكون السجل ما زال مفتوحًا، فلا يُغلق مرتين حتى مع طلبين متزامنين.
-    const r = q.checkOut.run(now, loc.lat, loc.lng, loc.accuracy, req.user.id);
+    const r = await db.run(q.checkOut, now, loc.lat, loc.lng, loc.accuracy, req.user.id);
     if (r.changes !== 1) return fail(res, 409, 'لم تسجّل دخولك بعد');
-    res.json({ ok: true, record: employeeView(q.recordById.get(open.id)) });
+    res.json({ ok: true, record: employeeView(await db.get(q.recordById, open.id)) });
   });
 
-  app.get('/api/my/records', employee, (req, res) => {
-    res.json({ records: q.myRecords.all(req.user.id, 10).map(employeeView) });
+  app.get('/api/my/records', employee, async (req, res) => {
+    res.json({ records: (await db.all(q.myRecords, req.user.id, 10)).map(employeeView) });
   });
 
   // ---------- الإدارة ----------
   const manager = requireRole('manager');
 
-  app.get('/api/admin/overview', manager, (req, res) => {
-    const employees = q.employees.all().map(shapeEmployee);
+  app.get('/api/admin/overview', manager, async (req, res) => {
+    const employees = (await db.all(q.employees)).map(shapeEmployee);
     res.json({
-      companies: q.companies.all(),
+      companies: await db.all(q.companies),
       employees,
-      managers: q.managers.all().map((m) => ({ ...m, active: !!m.active })),
+      managers: (await db.all(q.managers)).map((m) => ({ ...m, active: !!m.active })),
       me_id: req.user.id,
       present_count: employees.filter((e) => e.open_record).length,
       server_now: new Date().toISOString(),
@@ -228,21 +239,21 @@ function createApp(db, opts = {}) {
     });
   });
 
-  app.get('/api/admin/records', manager, (req, res) => {
+  app.get('/api/admin/records', manager, async (req, res) => {
     const f = parseFilters(req.query);
     if (f.error) return fail(res, 400, f.error);
-    const records = queryRecords(f);
+    const records = await queryRecords(f);
     res.json({ records, totals: totalsByEmployee(records), truncated: records.length >= MAX_ROWS });
   });
 
   app.get('/api/admin/records.xlsx', manager, async (req, res, next) => {
     const f = parseFilters(req.query);
     if (f.error) return fail(res, 400, f.error);
-    try { await sendXlsx(res, queryRecords(f)); } catch (e) { next(e); }
+    try { await sendXlsx(res, await queryRecords(f)); } catch (e) { next(e); }
   });
 
   // إضافة موظف أو مدير. الموظف يجب أن ينتمي لشركة؛ المدير يرى الشركتين.
-  app.post('/api/admin/users', manager, (req, res) => {
+  app.post('/api/admin/users', manager, async (req, res) => {
     const b = req.body || {};
     const role = b.role === 'manager' ? 'manager' : 'employee';
     const fullName = cleanName(b.full_name);
@@ -252,12 +263,12 @@ function createApp(db, opts = {}) {
     let companyId = null;
     if (role === 'employee') {
       companyId = Number(b.company_id);
-      if (!q.companyById.get(companyId)) return fail(res, 400, 'اختر الشركة');
+      if (!await db.get(q.companyById, companyId)) return fail(res, 400, 'اختر الشركة');
     }
     const pwErr = validatePassword(b.password);
     if (pwErr) return fail(res, 400, pwErr);
     try {
-      const r = q.insertUser.run(username, hashPassword(b.password), fullName, role, companyId, new Date().toISOString());
+      const r = await db.run(q.insertUser, username, hashPassword(b.password), fullName, role, companyId, new Date().toISOString());
       res.status(201).json({ ok: true, id: Number(r.lastInsertRowid) });
     } catch (e) {
       if (/UNIQUE/i.test(e.message)) return fail(res, 409, 'اسم المستخدم مستخدم مسبقًا');
@@ -265,9 +276,9 @@ function createApp(db, opts = {}) {
     }
   });
 
-  app.patch('/api/admin/users/:id', manager, (req, res) => {
+  app.patch('/api/admin/users/:id', manager, async (req, res) => {
     const id = Number(req.params.id);
-    const target = Number.isInteger(id) ? q.userById.get(id) : null;
+    const target = Number.isInteger(id) ? await db.get(q.userById, id) : null;
     if (!target) return fail(res, 404, 'الحساب غير موجود');
     const b = req.body || {};
     const sets = [];
@@ -280,14 +291,14 @@ function createApp(db, opts = {}) {
     if (b.company_id !== undefined) {
       if (target.role !== 'employee') return fail(res, 400, 'المدير غير مرتبط بشركة');
       const c = Number(b.company_id);
-      if (!q.companyById.get(c)) return fail(res, 400, 'الشركة غير موجودة');
+      if (!await db.get(q.companyById, c)) return fail(res, 400, 'الشركة غير موجودة');
       sets.push('company_id = ?'); vals.push(c);
     }
     if (b.active !== undefined) {
       if (typeof b.active !== 'boolean') return fail(res, 400, 'قيمة الحالة غير صحيحة');
       if (!b.active && target.role === 'manager') {
         if (target.id === req.user.id) return fail(res, 400, 'لا يمكنك إيقاف حسابك أنت');
-        if (target.active && q.activeManagers.get().n <= 1) return fail(res, 400, 'يجب أن يبقى مدير واحد فعّال على الأقل');
+        if (target.active && (await db.get(q.activeManagers)).n <= 1) return fail(res, 400, 'يجب أن يبقى مدير واحد فعّال على الأقل');
       }
       sets.push('active = ?'); vals.push(b.active ? 1 : 0);
     }
@@ -297,17 +308,17 @@ function createApp(db, opts = {}) {
       sets.push('password_hash = ?'); vals.push(hashPassword(b.password));
     }
     if (!sets.length) return fail(res, 400, 'لا توجد تعديلات');
-    db.prepare(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`).run(...vals, id);
-    if (b.active === false || (b.password !== undefined && id !== req.user.id)) q.deleteUserSessions.run(id);
+    await db.run(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`, ...vals, id);
+    if (b.active === false || (b.password !== undefined && id !== req.user.id)) await db.run(q.deleteUserSessions, id);
     res.json({ ok: true });
   });
 
-  app.patch('/api/admin/companies/:id', manager, (req, res) => {
+  app.patch('/api/admin/companies/:id', manager, async (req, res) => {
     const id = Number(req.params.id);
     const name = cleanName(req.body?.name);
-    if (!q.companyById.get(id)) return fail(res, 404, 'الشركة غير موجودة');
+    if (!await db.get(q.companyById, id)) return fail(res, 404, 'الشركة غير موجودة');
     if (!name) return fail(res, 400, 'اسم الشركة مطلوب');
-    try { q.renameCompany.run(name, id); } catch (e) {
+    try { await db.run(q.renameCompany, name, id); } catch (e) {
       if (/UNIQUE/i.test(e.message)) return fail(res, 409, 'يوجد شركة بالاسم نفسه');
       throw e;
     }
@@ -355,12 +366,12 @@ function createApp(db, opts = {}) {
     return f;
   }
 
-  function queryRecords(f) {
+  async function queryRecords(f) {
     const where = f.where.length ? 'WHERE ' + f.where.join(' AND ') : '';
-    return db.prepare(`
+    return (await db.all(`
       SELECT a.*, u.full_name AS employee_name, c.name AS company_name
       FROM attendance a JOIN users u ON u.id = a.user_id JOIN companies c ON c.id = a.company_id
-      ${where} ORDER BY a.check_in_at DESC LIMIT ${MAX_ROWS}`).all(...f.vals).map(shapeRecord);
+      ${where} ORDER BY a.check_in_at DESC LIMIT ${MAX_ROWS}`, ...f.vals)).map(shapeRecord);
   }
 
   // ملف Excel حقيقي: ورقة من اليمين لليسار بالأعمدة المهمة فقط، وورقة ثانية لمجموع ساعات كل موظف.

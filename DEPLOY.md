@@ -1,56 +1,57 @@
-# رفع التطبيق على Render — خطوة بخطوة
+# رفع التطبيق — نسخة تجريبية مجانية (Render + Turso)
 
-التكلفة المتوقعة: خطة Starter + قرص 1GB ≈ **$7.25 شهريًا** (تأكد من صفحة الأسعار الرسمية قبل الدفع).
+- **Render (مجاني):** يشغّل التطبيق ويعطيك رابط HTTPS.
+- **Turso (مجاني):** يحفظ قاعدة البيانات بشكل دائم (Render المجاني يمسح ملفاته عند كل توقف).
+- **ملاحظة:** Render المجاني ينام بعد 15 دقيقة بدون زيارات؛ أول فتح بعدها ينتظر حوالي دقيقة. الحل المجاني في الخطوة 5.
 
-## 1) رفع المشروع على GitHub
-1. ادخل [github.com](https://github.com) وأنشئ حسابًا إن لم يكن لديك.
-2. اضغط **New repository**:
-   - الاسم: `attendance` (أو أي اسم)
-   - اختر **Private** (مهم)
-   - لا تضف README ولا .gitignore (المشروع جاهز)
-3. انسخ رابط المستودع (مثل `https://github.com/USERNAME/attendance.git`) ونفّذ داخل مجلد `C:\hr system`:
+المستودع على GitHub جاهز. بعد أي تعديل: `git push` والنشر تلقائي.
 
-```bash
-git remote add origin https://github.com/USERNAME/attendance.git
-```
+## 1) قاعدة البيانات على Turso
+1. ادخل [turso.tech](https://turso.tech) ← **Sign up** ← سجّل بحساب GitHub.
+2. من اللوحة: **Create Database**:
+   - الاسم: `attendance`
+   - الموقع (Location): الأقرب لفرانكفورت (مثل `AWS Frankfurt / eu-central-1`)
+3. افتح قاعدة البيانات واحفظ قيمتين:
+   - **URL**: يبدأ بـ `libsql://` (مثل `libsql://attendance-xxxx.turso.io`)
+   - **Token**: من **Generate Token / Create Token** (صلاحية قراءة وكتابة، بدون انتهاء). انسخه فورًا — لا يظهر مرة ثانية.
 
-```bash
-git push -u origin main
-```
-
-   ستفتح نافذة تسجيل دخول GitHub أول مرة — وافق عليها.
-
-## 2) إنشاء الخدمة على Render
-1. ادخل [render.com](https://render.com) واضغط **Get Started** ← سجّل باستخدام **GitHub**.
-2. من الأعلى: **New +** ← **Blueprint**.
-3. اربط حساب GitHub واختر مستودع `attendance`. سيقرأ Render ملف `render.yaml` تلقائيًا ويعرض:
-   - خدمة ويب اسمها `attendance` (خطة Starter، منطقة Frankfurt)
-   - قرص دائم `attendance-data` على `/data` بحجم 1GB
-4. سيطلب منك قيمتين:
-   - `ADMIN_USERNAME`: اسم دخول المدير (إنجليزي، مثل `ali`)
-   - `ADMIN_PASSWORD`: كلمة مرور قوية (8 أحرف على الأقل) — احفظها عندك
-5. اضغط **Apply**، وأضف بطاقة الدفع إذا طُلب منك.
-6. انتظر 3–5 دقائق حتى تصبح الحالة **Live**. في **Logs** يجب أن ترى:
-   `Created manager account "..."` ثم `Attendance app listening`.
+## 2) الخدمة على Render
+1. ادخل [render.com](https://render.com) ← سجّل بحساب GitHub **AhmadElayyan35**، واسمح له بالوصول لمستودع `attendance` فقط.
+2. **New +** ← **Blueprint** ← اختر `attendance` ← **Connect**.
+3. سيظهر أنه سينشئ خدمة `attendance` بالخطة **Free**، ويطلب 4 قيم:
+   - `DATABASE_URL`: رابط Turso (يبدأ بـ `libsql://`)
+   - `DATABASE_AUTH_TOKEN`: التوكن من Turso
+   - `ADMIN_USERNAME`: اسم دخولك (إنجليزي، مثل `ali`)
+   - `ADMIN_PASSWORD`: كلمة مرور قوية (8+ أحرف) — احفظها
+4. **Apply**. لا يحتاج بطاقة للخطة المجانية.
+5. افتح الخدمة ← **Logs**، وانتظر 3–5 دقائق حتى ترى:
+   `Database: attendance-xxxx.turso.io` ثم `Created manager account "ali"` ثم `Attendance app listening`.
 
 ## 3) أول دخول
-1. افتح الرابط الظاهر أعلى صفحة الخدمة (مثل `https://attendance-xxxx.onrender.com`).
-2. ادخل باسم المدير وكلمة المرور.
-3. **مهم:** في Render ← الخدمة ← **Environment** احذف `ADMIN_PASSWORD` واحفظ (الحساب أصبح محفوظًا في قاعدة البيانات).
-4. من **الموظفون** أضف الموظفين، وأرسل لكل واحد الرابط + بيانات دخوله.
+1. افتح الرابط أعلى صفحة الخدمة (مثل `https://attendance-xxxx.onrender.com`) وادخل كمدير.
+2. Render ← الخدمة ← **Environment** ← احذف `ADMIN_PASSWORD` ← **Save Changes**.
+3. من **الموظفون** أضف الموظفين وأرسل لهم الرابط وبيانات الدخول.
 
-## 4) تثبيته على هواتف الموظفين
-- **Android (Chrome):** افتح الرابط ← زر «تثبيت» في التطبيق، أو ⋮ ← «تثبيت التطبيق».
-- **iPhone (Safari):** افتح الرابط ← زر المشاركة ⬆︎ ← «إضافة إلى الشاشة الرئيسية».
-- أول تسجيل دخول للدوام سيطلب الهاتف إذن الموقع ← «السماح».
+## 4) على هواتف الموظفين
+- **Android (Chrome):** زر «تثبيت» في التطبيق، أو ⋮ ← «تثبيت التطبيق».
+- **iPhone (Safari):** زر المشاركة ⬆︎ ← «إضافة إلى الشاشة الرئيسية».
+- أول تسجيل دوام يطلب الهاتف إذن الموقع ← «السماح».
 
-## 5) التحديثات لاحقًا
-أي تعديل يُرفع بـ `git push` يُنشر تلقائيًا خلال دقائق، والبيانات تبقى على القرص.
+## 5) (اختياري) منع النوم — مجانًا
+1. ادخل [cron-job.org](https://cron-job.org) وأنشئ حسابًا مجانيًا.
+2. **Create cronjob**: الرابط `https://attendance-xxxx.onrender.com/api/health`، كل **10 دقائق**.
+هكذا يبقى التطبيق جاهزًا دائمًا. (التشغيل المتواصل يستهلك حوالي 744 ساعة من 750 ساعة مجانية شهريًا — يكفي لخدمة واحدة فقط.)
 
-## دومين خاص (اختياري)
-Render ← الخدمة ← **Settings** ← **Custom Domains** ← أضف النطاق (مثل `hudoor.company.com`)، ثم أضف سجل CNAME عند مزوّد الدومين كما يعرضه Render. شهادة HTTPS تُصدر تلقائيًا.
+## الترقية بعد الموافقة (مدفوع)
+Render ← الخدمة ← **Settings** ← **Instance Type** ← **Starter** (~$7/شهر). لا شيء آخر يتغير: البيانات تبقى على Turso، والتطبيق لا ينام. يمكنك حينها إيقاف cron-job.
 
 ## إذا حصلت مشكلة
 - فشل البناء أو التشغيل: انسخ آخر سطور **Logs** وأرسلها.
-- نسيت كلمة مرور المدير: Render ← الخدمة ← **Shell** ← `npm run create-manager` (تعيد تعيين كلمة المرور).
-- النسخ الاحتياطية اليومية محفوظة في `/data/backups` على نفس القرص.
+- `Startup failed`: غالبًا `DATABASE_URL` أو `DATABASE_AUTH_TOKEN` غير صحيح — انسخهما من Turso مرة أخرى.
+- نسيت كلمة مرور المدير: من جهازك في PowerShell داخل `C:\hr system` (بقيم Turso نفسها):
+
+```powershell
+$env:DATABASE_URL="libsql://attendance-xxxx.turso.io"; $env:DATABASE_AUTH_TOKEN="التوكن"; npm run create-manager
+```
+
+  ثم أدخل اسم المستخدم نفسه وكلمة مرور جديدة.

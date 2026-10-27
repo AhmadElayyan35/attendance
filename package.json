@@ -9,11 +9,12 @@
     "node": ">=22.13"
   },
   "scripts": {
-    "start": "node --disable-warning=ExperimentalWarning src/server.js",
-    "create-manager": "node --disable-warning=ExperimentalWarning scripts/create-manager.js",
-    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
+    "start": "node src/server.js",
+    "create-manager": "node scripts/create-manager.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
+    "@libsql/client": "^0.15.15",
     "exceljs": "^4.4.0",
     "express": "^4.22.3"
   }

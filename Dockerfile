@@ -14,4 +14,4 @@ ENV DB_PATH=/data/attendance.db PORT=3000
 EXPOSE 3000
 HEALTHCHECK --interval=1m --timeout=5s CMD wget -qO- "http://localhost:${PORT}/api/health" || exit 1
 ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["node", "--disable-warning=ExperimentalWarning", "src/server.js"]
+CMD ["node", "src/server.js"]
