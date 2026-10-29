@@ -407,13 +407,27 @@
     return h('div', { class: 'section-head' }, h('div', {}, h('h1', {}, title), sub ? h('p', {}, sub) : null), h('div', { class: 'row' }, actions));
   }
 
-  function locLink(lat, lng, acc) {
+  const fmtDist = (m) => (m >= 1000 ? `${(m / 1000).toFixed(1)} كم` : `${m} م`);
+  const mapsUrl = (lat, lng) => `https://www.google.com/maps/search/?api=1&query=${lat},${lng}`;
+  // تقدير المكان: في المكتب / خارج المكتب / غير مؤكد — مع رابط الخريطة للتأكد بنفسك.
+  function locLink(lat, lng, acc, place) {
     if (lat == null) return h('span', { class: 'muted' }, '—');
-    const weak = acc > (state.accWarn || 100);
-    return h('span', { class: 'loc' },
-      h('a', { href: `https://www.google.com/maps/search/?api=1&query=${lat},${lng}`, target: '_blank', rel: 'noopener noreferrer' }, icon('pin'), 'الخريطة'),
-      h('span', { class: 'acc' + (weak ? ' weak' : ''), title: weak ? 'دقة الموقع ضعيفة — الموقع تقريبي' : 'دقة الموقع التقريبية' }, `±${Math.round(acc)}م`));
+    const accText = `دقة القراءة ±${Math.round(acc)} م`;
+    let badge;
+    if (!place) {
+      const weak = acc > (state.accWarn || 100);
+      badge = h('span', { class: 'acc' + (weak ? ' weak' : ''), title: accText }, `±${Math.round(acc)}م`);
+    } else if (place.place === 'inside') {
+      badge = h('span', { class: 'pill in', title: `على بعد ${fmtDist(place.distance_m)} من المكتب · ${accText}` }, 'في المكتب');
+    } else if (place.place === 'outside') {
+      badge = h('span', { class: 'pill off', title: `خارج نطاق المكتب · ${accText}` }, `خارج المكتب · ${fmtDist(place.distance_m)}`);
+    } else {
+      badge = h('span', { class: 'pill open', title: `القراءة قريبة لكن دقتها لا تكفي للحكم · ${accText}` }, `غير مؤكد · ${fmtDist(place.distance_m)}`);
+    }
+    return h('span', { class: 'loc' }, badge,
+      h('a', { href: mapsUrl(lat, lng), target: '_blank', rel: 'noopener noreferrer', title: 'افتح الموقع على الخريطة' }, icon('map'), 'الخريطة'));
   }
+  const needsReview = (r) => [r.in_place, r.out_place].some((p) => p && p.place !== 'inside');
 
   // --- اليوم ---
   function viewHome(main, ov) {
@@ -444,7 +458,7 @@
           return h('li', { class: 'person' }, avatar(e.full_name, e.company_id),
             h('div', { class: 'grow' }, h('div', { class: 'name' }, e.full_name),
               h('div', { class: 'meta' }, companyTag(e.company_id), h('span', {}, `دخل ${fmtTime(o.check_in_at)}`))),
-            h('div', { class: 'side' }, h('span', { class: 'pill in' }, dur), locLink(o.in_lat, o.in_lng, o.in_accuracy)));
+            h('div', { class: 'side' }, h('span', { class: 'pill in' }, dur), locLink(o.in_lat, o.in_lng, o.in_accuracy, o.in_place)));
         })) : h('div', { class: 'empty' }, icon('clock'), h('div', {}, 'لا يوجد أحد في الدوام حاليًا'))),
       h('div', { class: 'card' }, h('h3', { class: 'card-title' }, `خارج الدوام (${absent.length})`),
         absent.length ? h('ul', { class: 'people' }, absent.map((e) => h('li', { class: 'person' }, avatar(e.full_name, e.company_id),
@@ -510,13 +524,25 @@
         const d = await api('/api/admin/records?' + qs());
         const totalMin = d.totals.reduce((s, t) => s + t.completed_minutes, 0);
         const open = d.records.filter((r) => r.status === 'open').length;
+        const flagged = d.records.filter(needsReview);
+        let reviewOnly = false;
+        const tableWrap = h('div', {});
+        const reviewKpi = h('button', { type: 'button', class: 'card kpi kpi-btn' + (flagged.length ? ' warn' : ''), 'aria-pressed': 'false',
+          title: 'اضغط لعرض التسجيلات التي تحتاج مراجعة فقط', onclick: () => { reviewOnly = !reviewOnly; drawTable(); } },
+        h('span', { class: 'ic' }, icon('pin')), h('div', {}, h('div', { class: 'num' }, flagged.length), h('div', { class: 'lbl' }, 'خارج المكتب أو غير مؤكد')));
+        const drawTable = () => {
+          reviewKpi.setAttribute('aria-pressed', String(reviewOnly));
+          tableWrap.replaceChildren(recordsTable(reviewOnly ? flagged : d.records, d.truncated, reviewOnly ? () => { reviewOnly = false; drawTable(); } : null));
+        };
+        drawTable();
         results.replaceChildren(
           h('div', { class: 'kpis mt' },
             h('div', { class: 'card kpi hero' }, h('span', { class: 'ic' }, icon('clock')), h('div', {}, h('div', { class: 'num' }, fmtDuration(totalMin)), h('div', { class: 'lbl' }, 'مجموع الساعات المكتملة'))),
             h('div', { class: 'card kpi' }, h('span', { class: 'ic' }, icon('check')), h('div', {}, h('div', { class: 'num' }, d.records.length - open), h('div', { class: 'lbl' }, 'دوام مكتمل'))),
-            h('div', { class: 'card kpi' }, h('span', { class: 'ic' }, icon('alert')), h('div', {}, h('div', { class: 'num' }, open), h('div', { class: 'lbl' }, 'مفتوح (غير محسوب)')))),
+            h('div', { class: 'card kpi' }, h('span', { class: 'ic' }, icon('alert')), h('div', {}, h('div', { class: 'num' }, open), h('div', { class: 'lbl' }, 'مفتوح (غير محسوب)'))),
+            reviewKpi),
           totalsTable(d.totals),
-          recordsTable(d.records, d.truncated));
+          tableWrap);
       } catch (e) {
         if (e.status !== 401) results.replaceChildren(h('div', { class: 'mt' }, msg('error', e.message)));
       }
@@ -537,10 +563,14 @@
         : h('div', { class: 'empty' }, icon('report'), h('div', {}, 'لا توجد سجلات في هذه الفترة')));
   }
 
-  function recordsTable(records, truncated) {
-    if (!records.length) return h('div');
+  function recordsTable(records, truncated, clearReview) {
+    if (!records.length && !clearReview) return h('div');
     const td = (label, ...c) => h('td', { 'data-label': label }, h('span', {}, ...c));
-    return h('div', { class: 'card' }, h('h3', { class: 'card-title' }, `تفاصيل الحضور (${records.length})`),
+    return h('div', { class: 'card' },
+      h('div', { class: 'row spread' }, h('h3', { class: 'card-title' }, clearReview ? `تحتاج مراجعة (${records.length})` : `تفاصيل الحضور (${records.length})`),
+        clearReview ? h('button', { class: 'btn ghost sm', type: 'button', onclick: clearReview }, icon('x'), 'عرض الكل') : null),
+      clearReview ? h('div', { class: 'field' }, msg('info', 'تسجيلات بعيدة عن المكتب أو دقتها لا تكفي للحكم. اضغط «الخريطة» بجانب كل واحدة للتأكد.')) : null,
+      !records.length ? h('div', { class: 'empty' }, icon('check'), h('div', {}, 'كل التسجيلات من داخل المكاتب 👍')) : null,
       truncated ? h('div', { class: 'field' }, msg('warn', 'تم عرض أول 5000 سجل. ضيّق الفترة لعرض الباقي.')) : null,
       h('div', { class: 'table-wrap' }, h('table', { class: 'data' },
         h('thead', {}, h('tr', {}, ['الموظف', 'الشركة', 'التاريخ', 'الدخول', 'موقع الدخول', 'الخروج', 'موقع الخروج', 'المدة', 'الحالة'].map((t) => h('th', {}, t)))),
@@ -549,10 +579,10 @@
           td('الشركة', r.company_name),
           td('التاريخ', h('span', { class: 'nowrap' }, fmtDate(r.check_in_at))),
           td('الدخول', h('span', { class: 'nowrap' }, fmtTime(r.check_in_at))),
-          td('موقع الدخول', locLink(r.in_lat, r.in_lng, r.in_accuracy)),
+          td('موقع الدخول', locLink(r.in_lat, r.in_lng, r.in_accuracy, r.in_place)),
           td('الخروج', h('span', { class: 'nowrap' }, r.check_out_at ? fmtTime(r.check_out_at) : '—'),
             r.check_out_at && ymdOf(new Date(r.check_out_at)) !== r.shift_date ? h('div', { class: 'small muted' }, fmtDate(r.check_out_at)) : null),
-          td('موقع الخروج', locLink(r.out_lat, r.out_lng, r.out_accuracy)),
+          td('موقع الخروج', locLink(r.out_lat, r.out_lng, r.out_accuracy, r.out_place)),
           td('المدة', r.status === 'completed' ? h('b', { class: 'nowrap' }, fmtDuration(r.duration_minutes)) : h('span', { class: 'muted' }, '—')),
           td('الحالة', r.status === 'completed' ? h('span', { class: 'pill done' }, 'مكتمل') : h('span', { class: 'pill open' }, 'مفتوح'))))))));
   }
@@ -727,7 +757,54 @@
             catch (ex) { if (ex.status !== 401) toast(ex.message, 'error'); }
           } }, logoChip(c.logo, 'kpi-logo'), h('div', { class: 'grow' }, inp), h('button', { class: 'btn sm', type: 'submit' }, 'حفظ'));
         })),
+      h('div', { class: 'card' }, h('h3', { class: 'card-title' }, 'مواقع المكاتب'),
+        h('p', { class: 'small muted' }, 'تُستخدم لتقدير إن كان التسجيل من داخل المكتب أو خارجه. أدق طريقة: افتح هذه الصفحة من هاتفك وأنت داخل المكتب واضغط «موقعي الحالي».'),
+        ov.companies.map(officeForm)),
       myAccountCard());
+  }
+
+  // يقبل رابط خرائط Google أو «خط عرض, خط طول».
+  function parseLatLng(text) {
+    let t = String(text || '');
+    try { t = decodeURIComponent(t); } catch { /* نص عادي */ }
+    const m = t.match(/(-?\d{1,2}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)/);
+    return m ? { lat: Number(m[1]), lng: Number(m[2]) } : null;
+  }
+
+  function officeForm(c) {
+    const has = c.office_lat != null;
+    const coords = h('input', { dir: 'ltr', value: has ? `${c.office_lat}, ${c.office_lng}` : '', placeholder: 'الصق رابط Google Maps أو 31.9, 35.2', 'aria-label': 'موقع المكتب' });
+    const radius = h('input', { type: 'number', min: 10, max: 1000, step: 5, value: c.office_radius_m || 50, dir: 'ltr', 'aria-label': 'النطاق بالمتر' });
+    const mapLink = h('a', { class: 'btn ghost sm', target: '_blank', rel: 'noopener noreferrer', href: has ? mapsUrl(c.office_lat, c.office_lng) : '#' }, icon('map'), 'الخريطة');
+    const status = h('div', { class: 'hint' });
+    const hereBtn = h('button', { class: 'btn ghost sm', type: 'button', onclick: () => {
+      if (!navigator.geolocation) return toast('المتصفح لا يدعم تحديد الموقع', 'error');
+      hereBtn.disabled = true; status.textContent = 'جارٍ تحديد موقعك…';
+      navigator.geolocation.getCurrentPosition((p) => {
+        hereBtn.disabled = false;
+        coords.value = `${p.coords.latitude.toFixed(7)}, ${p.coords.longitude.toFixed(7)}`;
+        status.textContent = `تم أخذ موقعك (دقة ±${Math.round(p.coords.accuracy)} م). اضغط «حفظ» لاعتماده.`;
+      }, () => { hereBtn.disabled = false; status.textContent = 'تعذّر تحديد موقعك. اسمح بإذن الموقع وحاول مرة أخرى.'; },
+      { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 });
+    } }, icon('pin'), 'موقعي الحالي');
+    return h('form', { class: 'office', onsubmit: async (ev) => {
+      ev.preventDefault();
+      const ll = parseLatLng(coords.value);
+      if (!ll) return toast('لم أتعرف على الإحداثيات. الصق رابط Google Maps أو اكتب: خط العرض, خط الطول', 'error');
+      try {
+        await api(`/api/admin/companies/${c.id}`, { method: 'PATCH', body: { office_lat: ll.lat, office_lng: ll.lng, office_radius_m: Number(radius.value) } });
+        coords.value = `${ll.lat}, ${ll.lng}`;
+        mapLink.href = mapsUrl(ll.lat, ll.lng);
+        toast(`تم حفظ موقع مكتب ${c.name}`, 'ok');
+      } catch (ex) { if (ex.status !== 401) toast(ex.message, 'error'); }
+    } },
+      h('div', { class: 'row' }, logoChip(c.logo), h('b', {}, c.name)),
+      h('div', { class: 'office-grid' },
+        h('div', {}, h('label', {}, 'موقع المكتب'), coords),
+        h('div', {}, h('label', {}, 'النطاق (متر)'), radius)),
+      h('div', { class: 'hint' }, 'النطاق يشمل المبنى وهامش خطأ GPS داخل المباني. 50 م مناسب لمكتب 140–150 م².'),
+      status,
+      h('div', { class: 'row mt' }, h('button', { class: 'btn sm', type: 'submit' }, 'حفظ'), hereBtn, mapLink));
   }
 
   // اسم المدير الظاهر في اللوحة، قابل للتعديل من حسابه.

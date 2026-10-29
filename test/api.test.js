@@ -297,6 +297,47 @@ test('installable app files are served', async () => {
   assert.equal((await fetch(base + '/icons/apple-touch-icon.png')).status, 200);
 });
 
+test('place estimate: inside / outside / uncertain', () => {
+  const { classifyPlace, distanceM } = require('../src/geo');
+  const office = { lat: 31.914379, lng: 35.209045, radius: 50 };
+  // 0.00018° عرض ≈ 20 م
+  assert.ok(Math.abs(distanceM(31.914379, 35.209045, 31.914559, 35.209045) - 20) < 1);
+  assert.equal(classifyPlace(31.914559, 35.209045, 15, office).place, 'inside', '20 م من المكتب');
+  assert.equal(classifyPlace(31.916179, 35.209045, 20, office).place, 'outside', '200 م بدقة 20 م');
+  assert.equal(classifyPlace(31.915189, 35.209045, 60, office).place, 'uncertain', '90 م لكن الدقة 60 م');
+  assert.equal(classifyPlace(31.916179, 35.209045, 500, office).place, 'uncertain', 'دقة ضعيفة جدًا');
+  assert.equal(classifyPlace(31.9, 35.2, 10, null), null, 'بدون موقع مكتب');
+});
+
+test('admin sees inside/outside per record; office location editable; hidden from others', async () => {
+  // سجل أحمد المفتوح كان من الخليل (LOC) بعيدًا عن مكتب التيسير
+  let r = await call('GET', `/api/admin/records?employee=${emp1Id}`, { cookie: mgr });
+  assert.equal(r.json.records[0].in_place.place, 'outside');
+  assert.ok(r.json.records[0].in_place.distance_m > 50000);
+  let ov = await call('GET', '/api/admin/overview', { cookie: mgr });
+  const tayseer = ov.json.companies.find((c) => c.id === 1);
+  assert.equal(tayseer.office_lat, 32.3192253);
+  assert.equal(tayseer.office_radius_m, 50);
+  assert.equal(ov.json.employees.find((e) => e.id === emp1Id).open_record.in_place.place, 'outside');
+
+  // نقل مكتب التيسير إلى مكان التسجيل → يصبح «في المكتب»
+  assert.equal((await call('PATCH', '/api/admin/companies/1', { cookie: mgr, body: { office_lat: LOC.lat, office_lng: LOC.lng, office_radius_m: 50 } })).status, 200);
+  r = await call('GET', `/api/admin/records?employee=${emp1Id}`, { cookie: mgr });
+  assert.equal(r.json.records[0].in_place.place, 'inside');
+  assert.equal((await call('PATCH', '/api/admin/companies/1', { cookie: mgr, body: { office_lat: 32.3192253, office_lng: 35.0257683, office_radius_m: 50 } })).status, 200);
+
+  // تحقق من المدخلات
+  assert.equal((await call('PATCH', '/api/admin/companies/1', { cookie: mgr, body: { office_lat: 32.3, office_lng: 35.0, office_radius_m: 5 } })).status, 400);
+  assert.equal((await call('PATCH', '/api/admin/companies/1', { cookie: mgr, body: { office_lat: 'x', office_lng: 35.0, office_radius_m: 50 } })).status, 400);
+  assert.equal((await call('PATCH', '/api/admin/companies/1', { cookie: emp1, body: { office_lat: 32.3, office_lng: 35.0, office_radius_m: 50 } })).status, 403);
+
+  // صفحة الدخول والموظف لا يرون مواقع المكاتب ولا التقدير
+  const pub = await call('GET', '/api/companies');
+  assert.equal(pub.json.companies[0].office_lat, undefined);
+  const me = await call('GET', '/api/me', { cookie: emp1 });
+  assert.equal(me.json.open_record.in_place, undefined);
+});
+
 test('logout ends the session', async () => {
   await call('POST', '/api/logout', { cookie: emp1, body: {} });
   assert.equal((await call('GET', '/api/me', { cookie: emp1 })).status, 401);

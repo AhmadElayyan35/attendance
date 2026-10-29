@@ -5,6 +5,7 @@ const express = require('express');
 const ExcelJS = require('exceljs');
 const { hashPassword, verifyPassword, DUMMY_HASH, validatePassword } = require('./passwords');
 const T = require('./time');
+const { classifyPlace } = require('./geo');
 
 const SESSION_DAYS = 30;
 const COOKIE = 'sid';
@@ -49,15 +50,17 @@ function createApp(db, opts = {}) {
     recordById: 'SELECT * FROM attendance WHERE id = ?',
     myRecords: 'SELECT * FROM attendance WHERE user_id = ? ORDER BY check_in_at DESC LIMIT ?',
     companies: 'SELECT id, name, logo FROM companies ORDER BY id',
+    companiesFull: 'SELECT id, name, logo, office_lat, office_lng, office_radius_m FROM companies ORDER BY id',
     companyById: 'SELECT id FROM companies WHERE id = ?',
-    renameCompany: 'UPDATE companies SET name = ? WHERE id = ?',
     employees: `
       SELECT u.id, u.username, u.full_name, u.company_id, c.name AS company_name, c.logo AS company_logo, u.active,
              a.id AS open_id, a.check_in_at AS open_check_in_at, a.in_lat AS open_in_lat,
              a.in_lng AS open_in_lng, a.in_accuracy AS open_in_accuracy,
+             ac.office_lat, ac.office_lng, ac.office_radius_m,
              (SELECT MAX(COALESCE(check_out_at, check_in_at)) FROM attendance WHERE user_id = u.id) AS last_activity_at
       FROM users u JOIN companies c ON c.id = u.company_id
       LEFT JOIN attendance a ON a.user_id = u.id AND a.check_out_at IS NULL
+      LEFT JOIN companies ac ON ac.id = a.company_id
       WHERE u.role = 'employee'
       ORDER BY u.active DESC, c.id, u.full_name`,
     managers: `SELECT id, username, full_name, active, created_at FROM users
@@ -229,7 +232,7 @@ function createApp(db, opts = {}) {
   app.get('/api/admin/overview', manager, async (req, res) => {
     const employees = (await db.all(q.employees)).map(shapeEmployee);
     res.json({
-      companies: await db.all(q.companies),
+      companies: await db.all(q.companiesFull),
       employees,
       managers: (await db.all(q.managers)).map((m) => ({ ...m, active: !!m.active })),
       me_id: req.user.id,
@@ -313,12 +316,31 @@ function createApp(db, opts = {}) {
     res.json({ ok: true });
   });
 
+  // اسم الشركة و/أو موقع مكتبها (مركز ونطاق بالمتر) لتقدير «داخل/خارج المكتب».
   app.patch('/api/admin/companies/:id', manager, async (req, res) => {
     const id = Number(req.params.id);
-    const name = cleanName(req.body?.name);
+    const b = req.body || {};
     if (!await db.get(q.companyById, id)) return fail(res, 404, 'الشركة غير موجودة');
-    if (!name) return fail(res, 400, 'اسم الشركة مطلوب');
-    try { await db.run(q.renameCompany, name, id); } catch (e) {
+    const sets = [];
+    const vals = [];
+    if (b.name !== undefined) {
+      const name = cleanName(b.name);
+      if (!name) return fail(res, 400, 'اسم الشركة مطلوب');
+      sets.push('name = ?'); vals.push(name);
+    }
+    if (b.office_lat !== undefined || b.office_lng !== undefined || b.office_radius_m !== undefined) {
+      const lat = Number(b.office_lat);
+      const lng = Number(b.office_lng);
+      const radius = Number(b.office_radius_m);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+        return fail(res, 400, 'إحداثيات المكتب غير صحيحة');
+      }
+      if (!Number.isFinite(radius) || radius < 10 || radius > 1000) return fail(res, 400, 'نطاق المكتب يجب أن يكون بين 10 و1000 متر');
+      sets.push('office_lat = ?', 'office_lng = ?', 'office_radius_m = ?');
+      vals.push(round(lat, 7), round(lng, 7), Math.round(radius));
+    }
+    if (!sets.length) return fail(res, 400, 'لا توجد تعديلات');
+    try { await db.run(`UPDATE companies SET ${sets.join(', ')} WHERE id = ?`, ...vals, id); } catch (e) {
       if (/UNIQUE/i.test(e.message)) return fail(res, 409, 'يوجد شركة بالاسم نفسه');
       throw e;
     }
@@ -369,7 +391,8 @@ function createApp(db, opts = {}) {
   async function queryRecords(f) {
     const where = f.where.length ? 'WHERE ' + f.where.join(' AND ') : '';
     return (await db.all(`
-      SELECT a.*, u.full_name AS employee_name, c.name AS company_name
+      SELECT a.*, u.full_name AS employee_name, c.name AS company_name,
+             c.office_lat, c.office_lng, c.office_radius_m
       FROM attendance a JOIN users u ON u.id = a.user_id JOIN companies c ON c.id = a.company_id
       ${where} ORDER BY a.check_in_at DESC LIMIT ${MAX_ROWS}`, ...f.vals)).map(shapeRecord);
   }
@@ -448,9 +471,15 @@ function shapeRecord(r) {
     in_lat: r.in_lat, in_lng: r.in_lng, in_accuracy: r.in_accuracy,
     check_out_at: r.check_out_at,
     out_lat: r.out_lat, out_lng: r.out_lng, out_accuracy: r.out_accuracy,
+    in_place: classifyPlace(r.in_lat, r.in_lng, r.in_accuracy, officeOf(r)),
+    out_place: completed ? classifyPlace(r.out_lat, r.out_lng, r.out_accuracy, officeOf(r)) : null,
     duration_minutes: completed ? T.durationMinutes(r.check_in_at, r.check_out_at) : null,
     status: completed ? 'completed' : 'open',
   };
+}
+
+function officeOf(r) {
+  return r.office_lat == null ? null : { lat: r.office_lat, lng: r.office_lng, radius: r.office_radius_m };
 }
 
 // ما يراه الموظف عن سجله: الأوقات فقط، بدون إحداثيات أو دقة أو مدد.
@@ -473,6 +502,7 @@ function shapeEmployee(e) {
     open_record: e.open_id ? {
       id: e.open_id, check_in_at: e.open_check_in_at,
       in_lat: e.open_in_lat, in_lng: e.open_in_lng, in_accuracy: e.open_in_accuracy,
+      in_place: classifyPlace(e.open_in_lat, e.open_in_lng, e.open_in_accuracy, officeOf(e)),
     } : null,
   };
 }

@@ -97,6 +97,16 @@ const MIGRATIONS = [
     'ALTER TABLE companies ADD COLUMN logo TEXT',
     "UPDATE companies SET logo = 'company-' || id || '.png' WHERE id IN (1, 2) AND logo IS NULL",
   ],
+  // 2: موقع مكتب كل شركة ونطاقه بالمتر (لتقدير داخل/خارج المكتب)
+  [
+    'ALTER TABLE companies ADD COLUMN office_lat REAL',
+    'ALTER TABLE companies ADD COLUMN office_lng REAL',
+    'ALTER TABLE companies ADD COLUMN office_radius_m REAL',
+    // شركة التيسير — شويكة، طولكرم (مكتب ~150 م²)
+    'UPDATE companies SET office_lat = 32.3192253, office_lng = 35.0257683, office_radius_m = 50 WHERE id = 1 AND office_lat IS NULL',
+    // اتحاد مقدمي خدمات المياه — البالوع، البيرة (مكتب ~140 م²)
+    'UPDATE companies SET office_lat = 31.914379, office_lng = 35.209045, office_radius_m = 50 WHERE id = 2 AND office_lat IS NULL',
+  ],
 ];
 
 // غلاف بسيط يعيد صفوفًا كائنات عادية.
