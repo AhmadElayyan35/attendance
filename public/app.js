@@ -767,6 +767,9 @@
   function parseLatLng(text) {
     let t = String(text || '');
     try { t = decodeURIComponent(t); } catch { /* نص عادي */ }
+    // روابط «place» في Google Maps فيها مركز الخريطة بعد @ والدبوس نفسه بعد !3d…!4d — الدبوس أدق.
+    const pin = t.match(/!3d(-?\d{1,2}\.\d+)!4d(-?\d{1,3}\.\d+)/);
+    if (pin) return { lat: Number(pin[1]), lng: Number(pin[2]) };
     const m = t.match(/(-?\d{1,2}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)/);
     return m ? { lat: Number(m[1]), lng: Number(m[2]) } : null;
   }
