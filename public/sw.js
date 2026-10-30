@@ -1,8 +1,8 @@
 'use strict';
 // يجعل التطبيق قابلًا للتثبيت ويفتح بسرعة. بيانات /api لا تُخزّن أبدًا؛ التسجيل يحتاج إنترنت دائمًا.
-const CACHE = 'attendance-v2';
+const CACHE = 'attendance-v3';
 const SHELL = ['/', '/app.js', '/styles.css', '/manifest.webmanifest',
-  '/icons/icon-192.png', '/icons/icon-512.png', '/logos/company-1.png', '/logos/company-2.png'];
+  '/icons/icon-192.png?v=2', '/icons/icon-512.png?v=2', '/icons/badge-96.png', '/logos/company-1.png', '/logos/company-2.png'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -33,7 +33,7 @@ self.addEventListener('push', (e) => {
   e.waitUntil(self.registration.showNotification(data.title || 'نظام الحضور والانصراف', {
     body: data.body || '',
     icon: '/icons/icon-192.png',
-    badge: '/icons/icon-192.png',
+    badge: '/icons/badge-96.png',
     tag: data.tag,
     lang: 'ar',
     dir: 'rtl',
