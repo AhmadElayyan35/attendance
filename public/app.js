@@ -188,6 +188,9 @@
     });
   }
   async function logout() {
+    stopLive();
+    // جهاز خرج منه المدير لا يجب أن تصله إشعارات الحضور
+    if (state.me?.user.role === 'manager') await disablePush().catch(() => {});
     try { await api('/api/logout', { method: 'POST', body: {} }); } catch { /* تجاهل */ }
     state.me = null;
     showLogin();
@@ -439,6 +442,7 @@
 
     main.append(
       installBanner(),
+      notifyBanner(),
       head('لوحة اليوم', F.date.format(now()), h('button', { class: 'btn ghost sm', onclick: () => showAdmin('home') }, icon('refresh'), 'تحديث')),
       h('div', { class: 'kpis' },
         h('div', { class: 'card kpi hero' }, h('span', { class: 'ic' }, icon('users')),
@@ -760,6 +764,7 @@
       h('div', { class: 'card' }, h('h3', { class: 'card-title' }, 'مواقع المكاتب'),
         h('p', { class: 'small muted' }, 'تُستخدم لتقدير إن كان التسجيل من داخل المكتب أو خارجه. أدق طريقة: افتح هذه الصفحة من هاتفك وأنت داخل المكتب واضغط «موقعي الحالي».'),
         ov.companies.map(officeForm)),
+      notifyCard(),
       myAccountCard());
   }
 
@@ -832,6 +837,129 @@
         h('button', { class: 'btn danger', type: 'button', onclick: logout }, icon('out'), 'تسجيل الخروج')));
   }
 
+  // ---------- تحديث مباشر للوحة الإدارة ----------
+  // عند أي دخول/خروج يرسل الخادم حدثًا فورًا، فتظهر رسالة وتتحدث الصفحة بدون إعادة تحميل.
+  let live = null;
+  function startLive() {
+    if (live || !window.EventSource) return;
+    live = new EventSource('/api/admin/events');
+    live.addEventListener('attendance', (e) => {
+      let ev;
+      try { ev = JSON.parse(e.data); } catch { return; }
+      const where = !ev.place ? '' : ev.place.place === 'inside' ? ' · في المكتب'
+        : ` · ${ev.place.place === 'outside' ? 'خارج المكتب' : 'غير مؤكد'} (${fmtDist(ev.place.distance_m)})`;
+      toast(`${ev.kind === 'in' ? 'دخول' : 'خروج'}: ${ev.employee_name} — ${fmtTime(ev.at)}${where}`, ev.place && ev.place.place !== 'inside' ? 'error' : 'ok');
+      // تحديث الصفحة الحالية إن لم يكن المدير وسط نافذة أو كتابة
+      if (['home', 'records'].includes(state.view) && !document.querySelector('dialog') && !document.activeElement?.matches('input, select')) {
+        showAdmin(state.view);
+      }
+    });
+  }
+  function stopLive() { if (live) { live.close(); live = null; } }
+
+  // ---------- إشعارات الهاتف للمدير (Web Push) ----------
+  const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+  function b64ToBytes(b64) {
+    const pad = '='.repeat((4 - (b64.length % 4)) % 4);
+    const raw = atob((b64 + pad).replace(/-/g, '+').replace(/_/g, '/'));
+    return Uint8Array.from(raw, (ch) => ch.charCodeAt(0));
+  }
+  async function currentSub() {
+    if (!pushSupported()) return null;
+    const reg = await navigator.serviceWorker.ready;
+    return reg.pushManager.getSubscription();
+  }
+  async function enablePush() {
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') throw new Error('لم يتم السماح بالإشعارات. فعّلها من إعدادات المتصفح/الهاتف لهذا التطبيق ثم حاول مرة أخرى.');
+    const { publicKey } = await api('/api/admin/push/key');
+    const reg = await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    try {
+      if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(publicKey) });
+    } catch {
+      // اشتراك قديم بمفتاح مختلف — نلغيه ونعيد المحاولة
+      if (sub) await sub.unsubscribe();
+      sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(publicKey) });
+    }
+    await api('/api/admin/push/subscribe', { method: 'POST', body: sub.toJSON() });
+  }
+  async function disablePush() {
+    const sub = await currentSub();
+    if (!sub) return;
+    await api('/api/admin/push/unsubscribe', { method: 'POST', body: { endpoint: sub.endpoint } }).catch(() => {});
+    await sub.unsubscribe();
+  }
+  // يتأكد أن اشتراك هذا الجهاز محفوظ على الخادم (مثلًا بعد نقل قاعدة البيانات)
+  async function syncPush() {
+    try {
+      const sub = await currentSub();
+      if (sub && Notification.permission === 'granted') await api('/api/admin/push/subscribe', { method: 'POST', body: sub.toJSON() });
+    } catch { /* غير مهم */ }
+  }
+
+  function pushHelpText() {
+    if (!pushSupported()) {
+      return isIos() && !isStandalone()
+        ? 'على iPhone: ثبّت التطبيق أولًا (المشاركة ← «إضافة إلى الشاشة الرئيسية») ثم افتحه من الأيقونة وفعّل الإشعارات من هنا.'
+        : 'هذا المتصفح لا يدعم الإشعارات. جرّب Chrome على Android أو التطبيق المثبّت على iPhone.';
+    }
+    if (Notification.permission === 'denied') return 'الإشعارات محظورة لهذا التطبيق. فعّلها من إعدادات الهاتف/المتصفح (الإشعارات) ثم ارجع هنا.';
+    return null;
+  }
+
+  // بطاقة الإعدادات: تشغيل/إيقاف إشعارات هذا الجهاز + إشعار تجريبي
+  function notifyCard() {
+    const body = h('div', {}, h('div', { class: 'skeleton' }));
+    const card = h('div', { class: 'card' }, h('h3', { class: 'card-title' }, 'إشعارات الحضور على هذا الجهاز'), body);
+    async function draw() {
+      const help = pushHelpText();
+      if (help) return body.replaceChildren(msg('info', help));
+      const on = !!(await currentSub().catch(() => null)) && Notification.permission === 'granted';
+      const toggle = h('button', { class: `btn ${on ? 'danger' : ''}`, type: 'button', onclick: async () => {
+        toggle.disabled = true;
+        try {
+          if (on) { await disablePush(); toast('تم إيقاف الإشعارات على هذا الجهاز', 'ok'); }
+          else { await enablePush(); toast('تم تفعيل الإشعارات على هذا الجهاز', 'ok'); }
+        } catch (e) { if (e.status !== 401) toast(e.message, 'error'); }
+        draw();
+      } }, icon(on ? 'x' : 'check'), on ? 'إيقاف الإشعارات' : 'تفعيل الإشعارات');
+      const test = on ? h('button', { class: 'btn ghost', type: 'button', onclick: async () => {
+        test.disabled = true;
+        try { await api('/api/admin/push/test', { method: 'POST', body: {} }); toast('تم إرسال إشعار تجريبي', 'ok'); }
+        catch (e) { if (e.status !== 401) toast(e.message, 'error'); }
+        test.disabled = false;
+      } }, 'إرسال إشعار تجريبي') : null;
+      body.replaceChildren(
+        h('div', { class: 'row field' }, h('span', { class: `pill ${on ? 'in' : 'out'}` }, on ? 'مفعّلة' : 'متوقفة'),
+          h('span', { class: 'small muted' }, on ? 'سيصلك إشعار عند كل تسجيل دخول أو خروج، حتى لو كان التطبيق مغلقًا.' : 'لن تصلك إشعارات على هذا الجهاز.')),
+        h('div', { class: 'row' }, toggle, test),
+        h('p', { class: 'hint' }, 'الإعداد لكل جهاز على حدة. تسجيل الخروج من الحساب يوقف الإشعارات على الجهاز.'));
+    }
+    draw();
+    return card;
+  }
+
+  // تذكير صغير في لوحة اليوم لتفعيل الإشعارات (مرة واحدة لكل جهاز)
+  function notifyBanner() {
+    let dismissed = false;
+    try { dismissed = localStorage.getItem('notifyDismissed') === '1'; } catch { /* تخزين غير متاح */ }
+    if (dismissed || !pushSupported() || Notification.permission !== 'default') return null;
+    const box = h('div', { class: 'install' });
+    const close = h('button', { class: 'close', type: 'button', 'aria-label': 'إخفاء', onclick: () => {
+      try { localStorage.setItem('notifyDismissed', '1'); } catch { /* تجاهل */ }
+      box.remove();
+    } }, icon('x'));
+    const btn = h('button', { class: 'btn sm', type: 'button', onclick: async () => {
+      btn.disabled = true;
+      try { await enablePush(); toast('تم تفعيل الإشعارات', 'ok'); box.remove(); }
+      catch (e) { btn.disabled = false; if (e.status !== 401) toast(e.message, 'error'); }
+    } }, 'تفعيل');
+    box.append(h('img', { src: '/icons/icon-192.png', alt: '' }),
+      h('div', { class: 'txt' }, h('b', {}, 'فعّل إشعارات الحضور'), 'يصلك إشعار على هاتفك عند كل دخول أو خروج'), btn, close);
+    return box;
+  }
+
   // ---------- تثبيت التطبيق على الهاتف ----------
   let installPrompt = null;
   window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); installPrompt = e; document.querySelectorAll('.install').forEach((b) => b.replaceWith(installBanner())); });
@@ -881,6 +1009,8 @@
     if (state.me.user.role === 'manager') {
       try { state.companies = (await api('/api/companies')).companies; } catch { /* تُحمّل لاحقًا */ }
       showAdmin('home');
+      startLive();
+      syncPush();
     } else {
       showEmployee();
     }

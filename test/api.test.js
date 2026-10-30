@@ -14,17 +14,27 @@ const fileUrl = (p) => 'file:' + p.split(path.sep).join('/');
 let db;
 let base, server;
 const LOC = { lat: 31.5326, lng: 35.0998, accuracy: 12.4 };
+// خدمة إشعارات وهمية: تسجّل ما كان سيُرسل للهواتف
+const pushed = [];
+const fakePush = {
+  publicKey: 'test-public-key',
+  async send(sub, payload) {
+    if (sub.endpoint.includes('expired')) throw Object.assign(new Error('gone'), { statusCode: 410 });
+    pushed.push({ endpoint: sub.endpoint, ...JSON.parse(payload) });
+  },
+};
+const until = async (cond, ms = 2000) => { const t = Date.now(); while (!cond()) { if (Date.now() - t > ms) throw new Error('timeout'); await new Promise((r) => setTimeout(r, 20)); } };
 
 test.before(async () => {
   db = await openDb(fileUrl(path.join(dir, 'test.db')));
   await db.run(`INSERT INTO users (username, password_hash, full_name, role, created_at) VALUES ('boss', ?, 'المدير', 'manager', ?)`,
     hashPassword('boss-pass-123'), new Date().toISOString());
-  server = createApp(db).listen(0);
+  server = createApp(db, { push: fakePush }).listen(0);
   await new Promise((r) => server.once('listening', r));
   base = `http://127.0.0.1:${server.address().port}`;
 });
 test.after(() => {
-  server.close(); db.close();
+  server.closeAllConnections(); server.close(); db.close();
   try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows قد يُبقي الملف مقفلًا لحظة */ }
 });
 
@@ -336,6 +346,59 @@ test('admin sees inside/outside per record; office location editable; hidden fro
   assert.equal(pub.json.companies[0].office_lat, undefined);
   const me = await call('GET', '/api/me', { cookie: emp1 });
   assert.equal(me.json.open_record.in_place, undefined);
+});
+
+test('admin gets live events and phone notifications on check-in/out; can turn them off', async () => {
+  // المدير يفعّل الإشعارات على جهازين، أحدهما انتهى اشتراكه
+  const sub = (endpoint) => ({ endpoint, keys: { p256dh: 'BPk-test-key', auth: 'auth-test' } });
+  assert.equal((await call('GET', '/api/admin/push/key', { cookie: mgr })).json.publicKey, 'test-public-key');
+  assert.equal((await call('POST', '/api/admin/push/subscribe', { cookie: mgr, body: sub('https://push.example.com/phone-1') })).status, 200);
+  assert.equal((await call('POST', '/api/admin/push/subscribe', { cookie: mgr, body: sub('https://push.example.com/expired-2') })).status, 200);
+  assert.equal((await call('POST', '/api/admin/push/subscribe', { cookie: mgr, body: { endpoint: 'http://not-https' } })).status, 400);
+  assert.equal((await call('POST', '/api/admin/push/subscribe', { cookie: emp1, body: sub('https://push.example.com/emp') })).status, 403);
+  assert.equal((await call('GET', '/api/admin/events', { cookie: emp1 })).status, 403);
+
+  // تدفق مباشر مفتوح عند المدير
+  const ctrl = new AbortController();
+  const stream = await fetch(base + '/api/admin/events', { headers: { Cookie: mgr }, signal: ctrl.signal });
+  assert.match(stream.headers.get('content-type'), /text\/event-stream/);
+  const reader = stream.body.getReader();
+  let streamText = '';
+  (async () => { try { for (;;) { const { value, done } = await reader.read(); if (done) break; streamText += new TextDecoder().decode(value); } } catch { /* أُغلق */ } })();
+
+  // أحمد يسجّل خروجه ثم دخوله من جديد
+  pushed.length = 0;
+  assert.equal((await call('POST', '/api/my/check-out', { cookie: emp1, body: LOC })).status, 200);
+  await until(() => pushed.length >= 1 && streamText.includes('"kind":"out"'));
+  const out = pushed.find((p) => p.title.startsWith('خروج'));
+  assert.equal(out.title, 'خروج: أحمد');
+  assert.match(out.body, /شركة التيسير · .* · خارج المكتب \(\d+\.\d كم\) · مدة العمل/);
+  assert.equal(out.endpoint, 'https://push.example.com/phone-1');
+  // الاشتراك المنتهي حُذف تلقائيًا
+  let expiredLeft = 1;
+  for (let i = 0; i < 100 && expiredLeft; i++) {
+    expiredLeft = (await db.get("SELECT COUNT(*) n FROM push_subscriptions WHERE endpoint LIKE '%expired%'")).n;
+    if (expiredLeft) await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.equal(expiredLeft, 0);
+
+  assert.equal((await call('POST', '/api/my/check-in', { cookie: emp1, body: LOC })).status, 201);
+  await until(() => pushed.some((p) => p.title === 'دخول: أحمد') && streamText.includes('"kind":"in"'));
+  const ev = JSON.parse(streamText.split('event: attendance\ndata: ').pop().split('\n')[0]);
+  assert.equal(ev.employee_name, 'أحمد');
+  assert.equal(ev.place.place, 'outside');
+
+  // إشعار تجريبي ثم إيقاف الإشعارات على الجهاز
+  assert.equal((await call('POST', '/api/admin/push/test', { cookie: mgr, body: {} })).json.sent, 1);
+  assert.equal((await call('POST', '/api/admin/push/unsubscribe', { cookie: mgr, body: { endpoint: 'https://push.example.com/phone-1' } })).status, 200);
+  pushed.length = 0;
+  assert.equal((await call('POST', '/api/my/check-out', { cookie: emp1, body: LOC })).status, 200);
+  await until(() => streamText.split('"kind":"out"').length > 2);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(pushed.length, 0, 'no notification after turning off');
+  assert.equal((await call('POST', '/api/admin/push/test', { cookie: mgr, body: {} })).status, 400);
+  assert.equal((await call('POST', '/api/my/check-in', { cookie: emp1, body: LOC })).status, 201); // يبقى في الدوام لاختبار الخروج من الحساب
+  ctrl.abort();
 });
 
 test('logout ends the session', async () => {

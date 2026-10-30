@@ -107,6 +107,18 @@ const MIGRATIONS = [
     // اتحاد مقدمي خدمات المياه — البالوع، البيرة (مكتب ~140 م²)
     'UPDATE companies SET office_lat = 31.914379, office_lng = 35.209045, office_radius_m = 50 WHERE id = 2 AND office_lat IS NULL',
   ],
+  // 3: اشتراكات إشعارات الهاتف لكل جهاز مدير، وإعدادات عامة (مثل مفاتيح الإشعارات)
+  [
+    `CREATE TABLE IF NOT EXISTS push_subscriptions (
+       id         INTEGER PRIMARY KEY,
+       user_id    INTEGER NOT NULL REFERENCES users(id),
+       endpoint   TEXT NOT NULL UNIQUE,
+       p256dh     TEXT NOT NULL,
+       auth       TEXT NOT NULL,
+       created_at TEXT NOT NULL
+     )`,
+    'CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
+  ],
 ];
 
 // غلاف بسيط يعيد صفوفًا كائنات عادية.

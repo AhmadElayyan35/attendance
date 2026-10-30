@@ -1,6 +1,7 @@
 'use strict';
 const path = require('node:path');
 const { openDb, backupDb } = require('./db');
+const webpush = require('web-push');
 const { createApp } = require('./app');
 const { databaseConfig } = require('./config');
 const { hashPassword, validatePassword } = require('./passwords');
@@ -29,6 +30,7 @@ const production = env.NODE_ENV === 'production';
   }
 
   const app = createApp(db, {
+    push: await setupPush(db),
     secureCookie: env.COOKIE_SECURE ? env.COOKIE_SECURE === '1' : production,
     trustProxy: env.TRUST_PROXY ? (/^\d+$/.test(env.TRUST_PROXY) ? Number(env.TRUST_PROXY) : env.TRUST_PROXY) : false,
     accuracyWarnM: Number(env.ACCURACY_WARN_M) || 100,
@@ -52,3 +54,25 @@ const production = env.NODE_ENV === 'production';
   console.error('Startup failed:', e.message);
   process.exit(1);
 });
+
+// مفاتيح VAPID لإشعارات الهاتف: من متغيرات البيئة إن وُجدت، وإلا تُولَّد مرة واحدة وتُحفظ في قاعدة البيانات
+// حتى تبقى ثابتة بين عمليات النشر (تغيّرها يُبطل اشتراكات الأجهزة).
+async function setupPush(db) {
+  let publicKey = env.VAPID_PUBLIC_KEY;
+  let privateKey = env.VAPID_PRIVATE_KEY;
+  if (!publicKey || !privateKey) {
+    const read = async () => {
+      const row = await db.get("SELECT value FROM app_settings WHERE key = 'vapid'");
+      return row ? JSON.parse(row.value) : null;
+    };
+    let keys = await read();
+    if (!keys) {
+      const k = webpush.generateVAPIDKeys();
+      await db.run("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('vapid', ?)", JSON.stringify(k));
+      keys = await read();
+    }
+    ({ publicKey, privateKey } = keys);
+  }
+  webpush.setVapidDetails(env.VAPID_SUBJECT || 'mailto:attendance-app@example.com', publicKey, privateKey);
+  return { publicKey, send: (subscription, payload) => webpush.sendNotification(subscription, payload, { TTL: 6 * 3600, urgency: 'high' }) };
+}

@@ -15,6 +15,7 @@ const MAX_ROWS = 5000;
 function createApp(db, opts = {}) {
   const secureCookie = opts.secureCookie ?? false;
   const accuracyWarnM = opts.accuracyWarnM ?? 100;
+  const push = opts.push || null; // { publicKey, send(subscription, payloadJson) } — Web Push
   const app = express();
   app.disable('x-powered-by');
   if (opts.trustProxy) app.set('trust proxy', opts.trustProxy);
@@ -52,6 +53,14 @@ function createApp(db, opts = {}) {
     companies: 'SELECT id, name, logo FROM companies ORDER BY id',
     companiesFull: 'SELECT id, name, logo, office_lat, office_lng, office_radius_m FROM companies ORDER BY id',
     companyById: 'SELECT id FROM companies WHERE id = ?',
+    companyOffice: 'SELECT id, name, office_lat, office_lng, office_radius_m FROM companies WHERE id = ?',
+    managerSubs: `SELECT s.* FROM push_subscriptions s JOIN users u ON u.id = s.user_id
+                  WHERE u.role = 'manager' AND u.active = 1`,
+    userSubs: 'SELECT * FROM push_subscriptions WHERE user_id = ?',
+    saveSub: `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, created_at) VALUES (?, ?, ?, ?, ?)
+              ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth`,
+    deleteSub: 'DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?',
+    deleteSubById: 'DELETE FROM push_subscriptions WHERE id = ?',
     employees: `
       SELECT u.id, u.username, u.full_name, u.company_id, c.name AS company_name, c.logo AS company_logo, u.active,
              a.id AS open_id, a.check_in_at AS open_check_in_at, a.in_lat AS open_in_lat,
@@ -203,7 +212,9 @@ function createApp(db, opts = {}) {
     const now = new Date().toISOString(); // وقت الخادم هو المرجع الرسمي
     try {
       const r = await db.run(q.checkIn, req.user.id, req.user.company_id, now, loc.lat, loc.lng, loc.accuracy);
-      res.status(201).json({ ok: true, record: employeeView(await db.get(q.recordById, r.lastInsertRowid)) });
+      const row = await db.get(q.recordById, r.lastInsertRowid);
+      announce('in', req.user, row);
+      res.status(201).json({ ok: true, record: employeeView(row) });
     } catch (e) {
       if (/UNIQUE/i.test(e.message)) return fail(res, 409, 'دوامك مسجّل بالفعل. سجّل خروجك أولًا');
       throw e;
@@ -219,7 +230,9 @@ function createApp(db, opts = {}) {
     // التحديث مشروط بأن يكون السجل ما زال مفتوحًا، فلا يُغلق مرتين حتى مع طلبين متزامنين.
     const r = await db.run(q.checkOut, now, loc.lat, loc.lng, loc.accuracy, req.user.id);
     if (r.changes !== 1) return fail(res, 409, 'لم تسجّل دخولك بعد');
-    res.json({ ok: true, record: employeeView(await db.get(q.recordById, open.id)) });
+    const row = await db.get(q.recordById, open.id);
+    announce('out', req.user, row);
+    res.json({ ok: true, record: employeeView(row) });
   });
 
   app.get('/api/my/records', employee, async (req, res) => {
@@ -313,6 +326,7 @@ function createApp(db, opts = {}) {
     if (!sets.length) return fail(res, 400, 'لا توجد تعديلات');
     await db.run(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`, ...vals, id);
     if (b.active === false || (b.password !== undefined && id !== req.user.id)) await db.run(q.deleteUserSessions, id);
+    if (b.active === false) for (const c of liveClients) if (c.userId === id) c.res.end();
     res.json({ ok: true });
   });
 
@@ -346,6 +360,93 @@ function createApp(db, opts = {}) {
     }
     res.json({ ok: true });
   });
+
+  // ---------- إشعارات الإدارة: مباشرة على الشاشة (SSE) وعلى الهاتف (Web Push) ----------
+  const liveClients = new Set();
+
+  app.get('/api/admin/events', manager, (req, res) => {
+    res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no', Connection: 'keep-alive' });
+    res.flushHeaders();
+    res.write('retry: 5000\n\n');
+    const client = { res, userId: req.user.id };
+    liveClients.add(client);
+    const ping = setInterval(() => res.write(': ping\n\n'), 25000); // يبقي الاتصال حيًا عبر الوكلاء
+    req.on('close', () => { clearInterval(ping); liveClients.delete(client); });
+  });
+
+  app.get('/api/admin/push/key', manager, (req, res) => {
+    if (!push) return fail(res, 503, 'الإشعارات غير مفعّلة على الخادم');
+    res.json({ publicKey: push.publicKey });
+  });
+
+  app.post('/api/admin/push/subscribe', manager, async (req, res) => {
+    const sub = req.body || {};
+    const endpoint = String(sub.endpoint || '');
+    const p256dh = String(sub.keys?.p256dh || '');
+    const auth = String(sub.keys?.auth || '');
+    if (!/^https:\/\/[^\s]{10,1000}$/.test(endpoint) || !p256dh || !auth || p256dh.length > 200 || auth.length > 100) {
+      return fail(res, 400, 'اشتراك الإشعارات غير صالح');
+    }
+    await db.run(q.saveSub, req.user.id, endpoint, p256dh, auth, new Date().toISOString());
+    res.json({ ok: true });
+  });
+
+  app.post('/api/admin/push/unsubscribe', manager, async (req, res) => {
+    await db.run(q.deleteSub, String(req.body?.endpoint || ''), req.user.id);
+    res.json({ ok: true });
+  });
+
+  app.post('/api/admin/push/test', manager, async (req, res) => {
+    if (!push) return fail(res, 503, 'الإشعارات غير مفعّلة على الخادم');
+    const subs = await db.all(q.userSubs, req.user.id);
+    if (!subs.length) return fail(res, 400, 'الإشعارات غير مفعّلة على هذا الجهاز');
+    const sent = await sendPush(subs, { title: 'تجربة إشعار ✓', body: 'الإشعارات تعمل على هذا الجهاز', tag: 'test', url: '/' });
+    res.json({ ok: true, sent });
+  });
+
+  // يُستدعى بعد حفظ الدخول/الخروج؛ لا يؤخر رد الموظف، وأي فشل هنا لا يؤثر على التسجيل.
+  function announce(kind, user, row) {
+    (async () => {
+      const company = await db.get(q.companyOffice, row.company_id);
+      const office = company?.office_lat == null ? null
+        : { lat: company.office_lat, lng: company.office_lng, radius: company.office_radius_m };
+      const at = kind === 'in' ? row.check_in_at : row.check_out_at;
+      const place = kind === 'in'
+        ? classifyPlace(row.in_lat, row.in_lng, row.in_accuracy, office)
+        : classifyPlace(row.out_lat, row.out_lng, row.out_accuracy, office);
+      const duration = kind === 'out' ? T.durationMinutes(row.check_in_at, row.check_out_at) : null;
+      const event = {
+        type: 'attendance', kind, record_id: row.id, user_id: user.id,
+        employee_name: user.full_name, company_name: company?.name || '', at, place, duration_minutes: duration,
+      };
+      const line = `event: attendance\ndata: ${JSON.stringify(event)}\n\n`;
+      for (const c of liveClients) c.res.write(line);
+
+      if (!push) return;
+      const placeText = !place ? '' : place.place === 'inside' ? 'في المكتب'
+        : `${place.place === 'outside' ? 'خارج المكتب' : 'موقع غير مؤكد'} (${fmtDistance(place.distance_m)})`;
+      const body = [company?.name, T.localTime(at), placeText, duration != null ? `مدة العمل ${T.formatDuration(duration)}` : '']
+        .filter(Boolean).join(' · ');
+      await sendPush(await db.all(q.managerSubs), {
+        title: `${kind === 'in' ? 'دخول' : 'خروج'}: ${user.full_name}`, body, tag: `att-${row.id}-${kind}`, url: '/',
+      });
+    })().catch((e) => console.error('announce failed:', e.message));
+  }
+
+  async function sendPush(subs, payload) {
+    let sent = 0;
+    await Promise.all(subs.map(async (s) => {
+      try {
+        await push.send({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, JSON.stringify(payload));
+        sent++;
+      } catch (e) {
+        // الاشتراك انتهى أو أُلغي من الجهاز
+        if (e.statusCode === 404 || e.statusCode === 410) await db.run(q.deleteSubById, s.id);
+        else console.error('push failed:', e.statusCode || e.message);
+      }
+    }));
+    return sent;
+  }
 
   app.use('/api', (req, res) => fail(res, 404, 'غير موجود'));
 
@@ -533,6 +634,7 @@ function parseLocation(body) {
   return { lat: round(lat, 7), lng: round(lng, 7), accuracy: round(accuracy, 1) };
 }
 
+function fmtDistance(m) { return m >= 1000 ? `${(m / 1000).toFixed(1)} كم` : `${m} م`; }
 function round(n, d) { const f = 10 ** d; return Math.round(n * f) / f; }
 function cleanName(s) { const n = String(s ?? '').trim().replace(/\s+/g, ' '); return n && n.length <= 80 ? n : null; }
 function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
