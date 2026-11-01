@@ -31,7 +31,8 @@ test.before(async () => {
   await db.run("INSERT INTO companies (id, name) VALUES (3, 'شركة تجريبية')");
   await db.run(`INSERT INTO users (username, password_hash, full_name, role, created_at) VALUES ('boss', ?, 'المدير', 'manager', ?)`,
     hashPassword('boss-pass-123'), new Date().toISOString());
-  server = createApp(db, { push: fakePush }).listen(0);
+  // ساعات دوام واسعة حتى لا تعتمد الاختبارات على وقت تشغيلها؛ قواعد 9–3 لها اختبار خاص
+  server = createApp(db, { push: fakePush, leaveRules: { start: '00:00', end: '23:59' } }).listen(0);
   await new Promise((r) => server.once('listening', r));
   base = `http://127.0.0.1:${server.address().port}`;
 });
@@ -411,6 +412,8 @@ test('logout ends the session', async () => {
 test('older databases lose company 1 (Al-Tayseer) and everything tied to it', async () => {
   const old = await openDb(fileUrl(path.join(dir, 'old.db')));
   // نعيد القاعدة إلى ما قبل الترحيل 4، كما هي على الخادم الحالي
+  await old.run('DROP TABLE leave_requests'); // ما أضافته الترحيلات 5 و6
+  await old.run('ALTER TABLE users DROP COLUMN reports_access');
   await old.run('UPDATE schema_version SET version = 3');
   await old.run("INSERT INTO companies (id, name, logo) VALUES (1, 'شركة التيسير', 'company-1.png')");
   const now = new Date().toISOString();
@@ -532,4 +535,69 @@ test('leave requests: request → manager decides → employee returns with loca
   // حذف الموظف يحذف مغادراته أيضًا
   assert.equal((await call('DELETE', `/api/admin/users/${lailaId}`, { cookie: mgr, body: {} })).status, 200);
   assert.equal((await db.get('SELECT COUNT(*) n FROM leave_requests WHERE user_id = ?', lailaId)).n, 0);
+});
+
+test('leave rules: only within work hours (9–3) and at most two hours', async () => {
+  // تطبيق ثانٍ بالقواعد الافتراضية على القاعدة نفسها
+  const strict = createApp(db, { push: fakePush }).listen(0);
+  await new Promise((r) => strict.once('listening', r));
+  const url = `http://127.0.0.1:${strict.address().port}`;
+  try {
+    await call('POST', '/api/admin/users', { cookie: mgr, body: { full_name: 'نور', username: 'noor', password: 'noor-pass-1', company_id: 2 } });
+    const emp = await login('noor', 'noor-pass-1');
+    const post = (body) => fetch(url + '/api/my/leaves', { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: emp }, body: JSON.stringify(body) })
+      .then(async (r) => ({ status: r.status, json: await r.json() }));
+    const day = T.addDays(T.localDate(new Date().toISOString()), 1);
+    let r = await post({ date: day, from: '08:30', to: '09:30' });
+    assert.equal(r.status, 400); assert.match(r.json.error, /9:00 ص – 3:00 م/);
+    assert.equal((await post({ date: day, from: '14:00', to: '15:30' })).status, 400, 'ends after 3');
+    r = await post({ date: day, from: '09:00', to: '11:30' });
+    assert.equal(r.status, 400); assert.match(r.json.error, /2 س/);
+    assert.equal((await post({ date: day, from: '13:00', to: '15:00' })).status, 201, 'exactly two hours up to 3 pm');
+    const me = await fetch(url + '/api/me', { headers: { Cookie: emp } }).then((x) => x.json());
+    assert.deepEqual(me.leave_rules, { start: '09:00', end: '15:00', maxMinutes: 120 });
+  } finally {
+    strict.closeAllConnections(); strict.close();
+  }
+});
+
+test('reports access (accountant): reports and Excel only, nothing else from admin', async () => {
+  const r = await call('POST', '/api/admin/users', { cookie: mgr, body: { full_name: 'محاسب', username: 'acct', password: 'acct-pass-1', company_id: 2 } });
+  const acctId = r.json.id;
+  const acct = await login('acct', 'acct-pass-1');
+  assert.equal((await call('GET', '/api/admin/records', { cookie: acct })).status, 403, 'not before the permission');
+  assert.equal((await call('GET', '/api/reports/meta', { cookie: acct })).status, 403);
+
+  assert.equal((await call('PATCH', `/api/admin/users/${acctId}`, { cookie: mgr, body: { reports_access: 'yes' } })).status, 400);
+  const bossId = (await db.get("SELECT id FROM users WHERE username = 'boss'")).id;
+  assert.equal((await call('PATCH', `/api/admin/users/${bossId}`, { cookie: mgr, body: { reports_access: true } })).status, 400);
+  assert.equal((await call('PATCH', `/api/admin/users/${acctId}`, { cookie: acct, body: { reports_access: true } })).status, 403, 'cannot grant self');
+  assert.equal((await call('PATCH', `/api/admin/users/${acctId}`, { cookie: mgr, body: { reports_access: true } })).status, 200);
+
+  assert.equal((await call('GET', '/api/me', { cookie: acct })).json.user.reports_access, true);
+  const meta = await call('GET', '/api/reports/meta', { cookie: acct });
+  assert.equal(meta.status, 200);
+  assert.ok(meta.json.employees.some((e) => e.full_name === 'محاسب'));
+  assert.ok(!('username' in meta.json.employees[0]), 'no account details');
+  const rec = await call('GET', '/api/admin/records', { cookie: acct });
+  assert.equal(rec.status, 200);
+  assert.ok(Array.isArray(rec.json.records));
+  const xlsx = await fetch(`${base}/api/admin/records.xlsx`, { headers: { Cookie: acct } });
+  assert.equal(xlsx.status, 200);
+  assert.match(xlsx.headers.get('content-type'), /spreadsheetml/);
+  // ما زال موظفًا: يسجّل حضوره ولا يملك أي صلاحية إدارية أخرى
+  assert.equal((await call('POST', '/api/my/check-in', { cookie: acct, body: LOC })).status, 201);
+  for (const [m, u, body] of [
+    ['GET', '/api/admin/overview'], ['GET', '/api/admin/leaves'],
+    ['POST', '/api/admin/users', { full_name: 'x', username: 'xyz1', password: 'pass-12345', company_id: 2 }],
+    ['PATCH', `/api/admin/users/${acctId}`, { full_name: 'x' }],
+    ['PATCH', '/api/admin/companies/2', { name: 'x' }],
+    ['DELETE', `/api/admin/users/${acctId}`, {}],
+  ]) assert.equal((await call(m, u, { cookie: acct, body })).status, 403, `${m} ${u}`);
+
+  // سحب الصلاحية
+  assert.equal((await call('PATCH', `/api/admin/users/${acctId}`, { cookie: mgr, body: { reports_access: false } })).status, 200);
+  assert.equal((await call('GET', '/api/admin/records', { cookie: acct })).status, 403);
+  const ov = await call('GET', '/api/admin/overview', { cookie: mgr });
+  assert.equal(ov.json.employees.find((e) => e.id === acctId).reports_access, false);
 });

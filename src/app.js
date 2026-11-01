@@ -17,6 +17,8 @@ function createApp(db, opts = {}) {
   const secureCookie = opts.secureCookie ?? false;
   const accuracyWarnM = opts.accuracyWarnM ?? 100;
   const push = opts.push || null; // { publicKey, send(subscription, payloadJson) } — Web Push
+  // ساعات الدوام (بتوقيت مكان العمل) وأقصى مدة للمغادرة بالدقائق
+  const leaveRules = { start: '09:00', end: '15:00', maxMinutes: 120, ...opts.leaveRules };
   const app = express();
   app.disable('x-powered-by');
   if (opts.trustProxy) app.set('trust proxy', opts.trustProxy);
@@ -34,7 +36,7 @@ function createApp(db, opts = {}) {
 
   const q = {
     sessionUser: `
-      SELECT u.id, u.username, u.full_name, u.role, u.company_id, c.name AS company_name, c.logo AS company_logo
+      SELECT u.id, u.username, u.full_name, u.role, u.company_id, u.reports_access, c.name AS company_name, c.logo AS company_logo
       FROM sessions s JOIN users u ON u.id = s.user_id LEFT JOIN companies c ON c.id = u.company_id
       WHERE s.token_hash = ? AND s.expires_at > ? AND u.active = 1`,
     insertSession: 'INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)',
@@ -63,7 +65,7 @@ function createApp(db, opts = {}) {
     deleteSub: 'DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?',
     deleteSubById: 'DELETE FROM push_subscriptions WHERE id = ?',
     employees: `
-      SELECT u.id, u.username, u.full_name, u.company_id, c.name AS company_name, c.logo AS company_logo, u.active,
+      SELECT u.id, u.username, u.full_name, u.company_id, c.name AS company_name, c.logo AS company_logo, u.active, u.reports_access,
              a.id AS open_id, a.check_in_at AS open_check_in_at, a.in_lat AS open_in_lat,
              a.in_lng AS open_in_lng, a.in_accuracy AS open_in_accuracy,
              ac.office_lat, ac.office_lng, ac.office_radius_m,
@@ -205,7 +207,8 @@ function createApp(db, opts = {}) {
     if (!req.user) return fail(res, 401, 'يرجى تسجيل الدخول');
     const open = req.user.role === 'employee' ? await db.get(q.openRecord, req.user.id) : null;
     res.json({
-      user: req.user,
+      user: { ...req.user, reports_access: !!req.user.reports_access },
+      leave_rules: req.user.role === 'employee' ? leaveRules : undefined,
       open_record: open ? employeeView(open) : null,
       server_now: new Date().toISOString(),
       timezone: T.WORK_TZ,
@@ -278,6 +281,10 @@ function createApp(db, opts = {}) {
     if (ends <= starts) return fail(res, 400, 'وقت النهاية يجب أن يكون بعد وقت البداية');
     if (ends - starts > 12 * 3600e3) return fail(res, 400, 'المغادرة لا يمكن أن تزيد عن 12 ساعة');
     if (ends.toISOString() <= nowIso) return fail(res, 400, 'وقت المغادرة انتهى بالفعل');
+    if (String(b.from) < leaveRules.start || String(b.to) > leaveRules.end) {
+      return fail(res, 400, `المغادرة تكون خلال ساعات الدوام (${hm12(leaveRules.start)} – ${hm12(leaveRules.end)})`);
+    }
+    if (ends - starts > leaveRules.maxMinutes * 60e3) return fail(res, 400, `أقصى مدة للمغادرة ${T.formatDuration(leaveRules.maxMinutes)}`);
     const reason = String(b.reason ?? '').trim().replace(/\s+/g, ' ');
     if (reason.length > 200) return fail(res, 400, 'السبب طويل جدًا (حتى 200 حرف)');
     const s = starts.toISOString(), e = ends.toISOString();
@@ -309,6 +316,22 @@ function createApp(db, opts = {}) {
 
   // ---------- الإدارة ----------
   const manager = requireRole('manager');
+  // التقارير: المدير، أو موظف لديه صلاحية التقارير (مثل المحاسب) — قراءة وتصدير فقط.
+  const reportsViewer = (req, res, next) => {
+    if (!req.user) return fail(res, 401, 'يرجى تسجيل الدخول');
+    if (req.user.role !== 'manager' && !req.user.reports_access) return fail(res, 403, 'ليست لديك صلاحية لهذه العملية');
+    next();
+  };
+
+  // ما تحتاجه صفحة التقارير للفلاتر، لمن لديه صلاحية التقارير
+  app.get('/api/reports/meta', reportsViewer, async (req, res) => {
+    res.json({
+      companies: await db.all(q.companies),
+      employees: (await db.all(q.employees)).map((e) => ({ id: e.id, full_name: e.full_name, company_id: e.company_id, active: !!e.active })),
+      server_now: new Date().toISOString(),
+      accuracy_warn_m: accuracyWarnM,
+    });
+  });
 
   app.get('/api/admin/overview', manager, async (req, res) => {
     const employees = (await db.all(q.employees)).map(shapeEmployee);
@@ -327,7 +350,7 @@ function createApp(db, opts = {}) {
     });
   });
 
-  app.get('/api/admin/records', manager, async (req, res) => {
+  app.get('/api/admin/records', reportsViewer, async (req, res) => {
     const f = parseFilters(req.query);
     if (f.error) return fail(res, 400, f.error);
     const records = await queryRecords(f);
@@ -369,7 +392,7 @@ function createApp(db, opts = {}) {
     res.json({ ok: true });
   });
 
-  app.get('/api/admin/records.xlsx', manager, async (req, res, next) => {
+  app.get('/api/admin/records.xlsx', reportsViewer, async (req, res, next) => {
     const f = parseFilters(req.query);
     if (f.error) return fail(res, 400, f.error);
     try { await sendXlsx(res, await queryRecords(f)); } catch (e) { next(e); }
@@ -424,6 +447,11 @@ function createApp(db, opts = {}) {
         if (target.active && (await db.get(q.activeManagers)).n <= 1) return fail(res, 400, 'يجب أن يبقى مدير واحد فعّال على الأقل');
       }
       sets.push('active = ?'); vals.push(b.active ? 1 : 0);
+    }
+    if (b.reports_access !== undefined) {
+      if (typeof b.reports_access !== 'boolean') return fail(res, 400, 'قيمة الصلاحية غير صحيحة');
+      if (target.role !== 'employee') return fail(res, 400, 'المدير يرى التقارير أصلًا');
+      sets.push('reports_access = ?'); vals.push(b.reports_access ? 1 : 0);
     }
     if (b.password !== undefined) {
       const err = validatePassword(b.password);
@@ -776,6 +804,7 @@ function shapeEmployee(e) {
   return {
     id: e.id, username: e.username, full_name: e.full_name,
     company_id: e.company_id, company_name: e.company_name, company_logo: e.company_logo, active: !!e.active,
+    reports_access: !!e.reports_access,
     last_activity_at: e.last_activity_at,
     open_record: e.open_id ? {
       id: e.open_id, check_in_at: e.open_check_in_at,
@@ -811,6 +840,8 @@ function parseLocation(body) {
   return { lat: round(lat, 7), lng: round(lng, 7), accuracy: round(accuracy, 1) };
 }
 
+// «09:00» ← «9:00 ص»
+function hm12(hm) { const [h, m] = hm.split(':').map(Number); return `${h % 12 || 12}:${String(m).padStart(2, '0')} ${h < 12 ? 'ص' : 'م'}`; }
 function fmtDistance(m) { return m >= 1000 ? `${(m / 1000).toFixed(1)} كم` : `${m} م`; }
 function round(n, d) { const f = 10 ** d; return Math.round(n * f) / f; }
 function cleanName(s) { const n = String(s ?? '').trim().replace(/\s+/g, ' '); return n && n.length <= 80 ? n : null; }

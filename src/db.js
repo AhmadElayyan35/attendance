@@ -157,6 +157,10 @@ const MIGRATIONS = [
     'CREATE INDEX IF NOT EXISTS leave_user_time ON leave_requests(user_id, starts_at)',
     'CREATE INDEX IF NOT EXISTS leave_status ON leave_requests(status, starts_at)',
   ],
+  // 6: صلاحية التقارير لموظف (مثل المحاسب): يرى صفحة التقارير ويصدّر Excel فقط، إضافة لحسابه كموظف.
+  [
+    'ALTER TABLE users ADD COLUMN reports_access INTEGER NOT NULL DEFAULT 0 CHECK (reports_access IN (0, 1))',
+  ],
 ];
 
 // غلاف بسيط يعيد صفوفًا كائنات عادية.

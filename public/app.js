@@ -269,6 +269,7 @@
     let leaveBusy = false;
 
     const menuList = h('div', { class: 'menu-list', hidden: true },
+      u.reports_access ? h('button', { type: 'button', onclick: showReports }, icon('report'), 'التقارير') : null,
       h('button', { type: 'button', onclick: () => { menuList.hidden = true; changeOwnPassword(); } }, icon('key'), 'تغيير كلمة المرور'),
       h('button', { type: 'button', onclick: logout }, icon('out'), 'تسجيل الخروج من الحساب'));
 
@@ -350,7 +351,8 @@
           h('div', {}, h('b', {}, 'أنت في مغادرة الآن'), h('div', { class: 'small' }, `من ${fmtTime(active.starts_at)} حتى ${fmtTime(active.ends_at)}`),
             late ? h('div', { class: 'small' }, 'انتهى وقت المغادرة — سجّل عودتك الآن') : null),
           h('button', { class: 'btn return-btn', type: 'button', disabled: !!leaveBusy, onclick: () => endLeave(active) },
-            leaveBusy ? h('span', { class: 'spinner' }) : icon('in'), leaveBusy || 'انتهت المغادرة — رجعت')) : null,
+            leaveBusy ? h('span', { class: 'spinner' }) : icon('in'), leaveBusy || 'لقد وصلت — إنهاء المغادرة'),
+          h('div', { class: 'small' }, 'إذا رجعت قبل الموعد اضغط الآن، ويصل للمدير أنك أنهيت مغادرتك.')) : null,
         leaves.length ? h('div', {}, leaves.slice(0, 5).map((l) => {
           const d = new Date(l.starts_at);
           const canCancel = l.phase === 'pending' || l.phase === 'upcoming';
@@ -369,12 +371,19 @@
     }
 
     function requestLeave() {
-      const t = now();
-      const hm = (d) => new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(d);
-      const start = new Date(Math.ceil(t / 300000) * 300000); // أقرب 5 دقائق قادمة
-      const date = h('input', { id: 'lv-date', type: 'date', required: true, value: today(), min: today(), max: addDays(today(), 30) });
-      const from = h('input', { id: 'lv-from', type: 'time', required: true, value: hm(start) });
-      const to = h('input', { id: 'lv-to', type: 'time', required: true, value: hm(new Date(+start + 3600e3)) });
+      const rules = state.me.leave_rules || { start: '09:00', end: '15:00', maxMinutes: 120 };
+      const toMin = (s) => { const [a, b] = s.split(':').map(Number); return a * 60 + b; };
+      const toHm = (m) => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+      const nowHm = new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(now());
+      // البداية: أقرب 5 دقائق قادمة ضمن الدوام؛ بعد انتهاء الدوام نقترح صباح الغد
+      let day = today();
+      let startMin = Math.max(Math.ceil(toMin(nowHm) / 5) * 5, toMin(rules.start));
+      if (startMin >= toMin(rules.end) - 5) { day = addDays(day, 1); startMin = toMin(rules.start); }
+      const endMin = Math.min(startMin + 60, toMin(rules.end));
+      const date = h('input', { id: 'lv-date', type: 'date', required: true, value: day, min: today(), max: addDays(today(), 30) });
+      const from = h('input', { id: 'lv-from', type: 'time', required: true, value: toHm(startMin), min: rules.start, max: rules.end });
+      const to = h('input', { id: 'lv-to', type: 'time', required: true, value: toHm(endMin), min: rules.start, max: rules.end });
+      const fmtHm = (s) => { const [a, b] = s.split(':').map(Number); return `${a % 12 || 12}:${String(b).padStart(2, '0')} ${a < 12 ? 'ص' : 'م'}`; };
       const reason = h('input', { id: 'lv-reason', maxlength: 200, placeholder: 'مثال: مراجعة طبيب' });
       openDialog({
         title: 'طلب مغادرة',
@@ -385,7 +394,7 @@
             h('div', { class: 'field' }, h('label', { for: 'lv-from' }, 'من الساعة'), from),
             h('div', { class: 'field' }, h('label', { for: 'lv-to' }, 'إلى الساعة'), to)),
           h('div', { class: 'field' }, h('label', { for: 'lv-reason' }, 'السبب (اختياري)'), reason),
-          h('p', { class: 'small muted' }, 'يصل الطلب للمدير مباشرة، وتظهر موافقته هنا.'),
+          h('p', { class: 'small muted' }, `المغادرة خلال الدوام (${fmtHm(rules.start)} – ${fmtHm(rules.end)}) وحتى ${fmtDuration(rules.maxMinutes)}. يصل الطلب للمدير مباشرة، وتظهر موافقته هنا.`),
         ],
         onSubmit: async () => {
           await api('/api/my/leaves', { method: 'POST', body: { date: date.value, from: from.value, to: to.value, reason: reason.value } });
@@ -456,6 +465,10 @@
       h('div', { class: 'card clock-card' }, clockEl, dateEl, statusEl),
       actionEl,
       feedback,
+      u.reports_access ? h('button', { class: 'card mt reports-link', type: 'button', onclick: showReports },
+        h('span', { class: 'ic' }, icon('report')),
+        h('div', { class: 'grow' }, h('b', {}, 'التقارير'), h('div', { class: 'small muted' }, 'سجلات الحضور وتصدير Excel')),
+        h('span', { class: 'muted' }, '‹')) : null,
       leaveBox,
       h('div', { class: 'card mt' }, h('h3', { class: 'card-title' }, 'آخر تسجيلاتك'), history)));
     tick(); render(); renderLeaves();
@@ -464,6 +477,27 @@
     every(30000, () => { if (document.visibilityState === 'visible' && !leaveBusy && !document.querySelector('dialog')) loadLeaves(); });
     loadHistory();
     loadLeaves();
+  }
+
+  // ---------- التقارير لموظف لديه صلاحية التقارير (المحاسب) ----------
+  async function showReports() {
+    const main = h('div', { class: 'admin-main' });
+    mount(h('div', {},
+      h('div', { class: 'reports-top' },
+        h('button', { class: 'btn ghost sm', type: 'button', onclick: showEmployee }, '→ رجوع'),
+        h('b', {}, 'التقارير')),
+      main));
+    main.append(h('div', { class: 'card' }, h('div', { class: 'skeleton' }), h('div', { class: 'skeleton' })));
+    try {
+      const meta = await api('/api/reports/meta');
+      state.skew = new Date(meta.server_now) - Date.now();
+      state.companies = meta.companies;
+      state.accWarn = meta.accuracy_warn_m;
+      main.replaceChildren();
+      viewRecords(main, meta);
+    } catch (e) {
+      if (e.status !== 401) main.replaceChildren(msg('error', e.message));
+    }
   }
 
   // ---------- لوحة الإدارة ----------
@@ -795,7 +829,7 @@
         h('div', { class: 'head' }, avatar(e.full_name, e.company_id),
           h('div', { class: 'grow' }, h('div', { class: 'name' }, h('b', {}, e.full_name)), h('div', { class: 'small muted ltr' }, '@' + e.username)),
           !e.active ? h('span', { class: 'pill off' }, 'موقوف') : e.open_record ? h('span', { class: 'pill in' }, 'في الدوام') : h('span', { class: 'pill out' }, 'خارج الدوام')),
-        h('div', { class: 'small' }, companyTag(e.company_id)),
+        h('div', { class: 'small row' }, companyTag(e.company_id), e.reports_access ? h('span', { class: 'pill done' }, 'محاسب · التقارير') : null),
         h('div', { class: 'actions' },
           h('button', { class: 'btn ghost sm', type: 'button', onclick: () => editUser(e, ov) }, icon('edit'), 'تعديل'),
           h('button', { class: 'btn ghost sm', type: 'button', onclick: () => resetPassword(e) }, icon('key'), 'كلمة مرور'),
@@ -865,16 +899,22 @@
   function editUser(e) {
     const isEmp = !!e.company_id;
     const name = h('input', { id: 'e-name', value: e.full_name, maxlength: 80, required: true });
+    const reports = h('input', { type: 'checkbox', id: 'e-reports', checked: e.reports_access });
     const { dlg } = openDialog({
       title: 'تعديل البيانات',
       body: [
         h('div', { class: 'field' }, h('label', { for: 'e-name' }, 'الاسم الكامل'), name),
         isEmp ? h('div', { class: 'field' }, h('label', {}, 'الشركة'), companyPicker(e.company_id, 'ecompany'),
           h('div', { class: 'hint' }, 'تغيير الشركة يسري على التسجيلات الجديدة فقط.')) : null,
+        isEmp ? h('div', { class: 'field' }, h('label', { class: 'check', for: 'e-reports' }, reports, ' صلاحية التقارير (محاسب)'),
+          h('div', { class: 'hint' }, 'يرى صفحة التقارير ويصدّر Excel فقط، ويبقى موظفًا يسجّل حضوره. لا يرى باقي لوحة الإدارة.')) : null,
       ],
       onSubmit: async () => {
         const body = { full_name: name.value };
-        if (isEmp) body.company_id = Number(dlg.querySelector('input[name=ecompany]:checked').value);
+        if (isEmp) {
+          body.company_id = Number(dlg.querySelector('input[name=ecompany]:checked').value);
+          body.reports_access = reports.checked;
+        }
         await api(`/api/admin/users/${e.id}`, { method: 'PATCH', body });
         toast('تم حفظ التعديلات', 'ok');
         showAdmin();
