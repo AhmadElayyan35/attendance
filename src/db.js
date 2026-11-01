@@ -134,6 +134,29 @@ const MIGRATIONS = [
     'DELETE FROM companies WHERE id = 1',
     ...DELETE_GUARDS,
   ],
+  // 5: طلبات المغادرة خلال الدوام: يطلبها الموظف، يقبلها المدير أو يرفضها، ويسجّل الموظف عودته بموقعه.
+  [
+    `CREATE TABLE IF NOT EXISTS leave_requests (
+       id           INTEGER PRIMARY KEY,
+       user_id      INTEGER NOT NULL REFERENCES users(id),
+       company_id   INTEGER NOT NULL REFERENCES companies(id),
+       starts_at    TEXT NOT NULL,
+       ends_at      TEXT NOT NULL,
+       reason       TEXT,
+       status       TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'cancelled')),
+       created_at   TEXT NOT NULL,
+       decided_by   INTEGER REFERENCES users(id),
+       decided_at   TEXT,
+       returned_at  TEXT,
+       ret_lat      REAL CHECK (ret_lat BETWEEN -90 AND 90),
+       ret_lng      REAL CHECK (ret_lng BETWEEN -180 AND 180),
+       ret_accuracy REAL CHECK (ret_accuracy >= 0),
+       CHECK (ends_at > starts_at),
+       CHECK (returned_at IS NULL OR (status = 'approved' AND ret_lat IS NOT NULL AND ret_lng IS NOT NULL AND ret_accuracy IS NOT NULL))
+     )`,
+    'CREATE INDEX IF NOT EXISTS leave_user_time ON leave_requests(user_id, starts_at)',
+    'CREATE INDEX IF NOT EXISTS leave_status ON leave_requests(status, starts_at)',
+  ],
 ];
 
 // غلاف بسيط يعيد صفوفًا كائنات عادية.
@@ -196,12 +219,13 @@ async function deleteEmployee(db, id) {
     'DROP TRIGGER IF EXISTS attendance_delete_guard',
     'DROP TRIGGER IF EXISTS users_delete_guard',
     { sql: 'DELETE FROM attendance WHERE user_id = ?', args: [id] },
+    { sql: 'DELETE FROM leave_requests WHERE user_id = ?', args: [id] },
     { sql: 'DELETE FROM sessions WHERE user_id = ?', args: [id] },
     { sql: 'DELETE FROM push_subscriptions WHERE user_id = ?', args: [id] },
     { sql: "DELETE FROM users WHERE id = ? AND role = 'employee'", args: [id] },
     ...DELETE_GUARDS,
   ]);
-  return { records: r[2].rowsAffected, deleted: r[5].rowsAffected };
+  return { records: r[2].rowsAffected, deleted: r[6].rowsAffected };
 }
 
 // نسخة احتياطية يومية متسقة (VACUUM INTO) لقاعدة البيانات المحلية، مع الاحتفاظ بآخر `keep` نسخة.

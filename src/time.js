@@ -24,9 +24,15 @@ function tzOffsetMs(date) {
 
 // تحويل منتصف ليل يوم محلي (YYYY-MM-DD) في Asia/Hebron إلى لحظة UTC.
 function localMidnightToUtc(ymd) {
+  return localToUtc(ymd, '00:00');
+}
+
+// تحويل يوم وساعة محليين (YYYY-MM-DD و HH:MM) في Asia/Hebron إلى لحظة UTC.
+function localToUtc(ymd, hm) {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd || '');
-  if (!m) return null;
-  const guess = Date.UTC(+m[1], +m[2] - 1, +m[3]);
+  const t2 = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(hm || '');
+  if (!m || !t2) return null;
+  const guess = Date.UTC(+m[1], +m[2] - 1, +m[3], +t2[1], +t2[2]);
   if (Number.isNaN(guess)) return null;
   let t = guess - tzOffsetMs(new Date(guess));
   t = guess - tzOffsetMs(new Date(t)); // تصحيح ثانٍ عند حدود التوقيت الصيفي
@@ -76,4 +82,4 @@ function formatDuration(minutes) {
   return h ? `${h} س ${String(m).padStart(2, '0')} د` : `${m} د`;
 }
 
-module.exports = { WORK_TZ, localMidnightToUtc, addDays, localDate, localDateTime, localTime, durationMinutes, formatHm, formatDuration };
+module.exports = { WORK_TZ, localMidnightToUtc, localToUtc, addDays, localDate, localDateTime, localTime, durationMinutes, formatHm, formatDuration };

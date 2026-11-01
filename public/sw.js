@@ -1,6 +1,6 @@
 'use strict';
 // يجعل التطبيق قابلًا للتثبيت ويفتح بسرعة. بيانات /api لا تُخزّن أبدًا؛ التسجيل يحتاج إنترنت دائمًا.
-const CACHE = 'attendance-v4';
+const CACHE = 'attendance-v5';
 const SHELL = ['/', '/app.js', '/styles.css', '/manifest.webmanifest',
   '/icons/icon-192.png?v=2', '/icons/icon-512.png?v=2', '/icons/badge-96.png', '/logos/company-2.png'];
 

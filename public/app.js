@@ -51,6 +51,7 @@
     check: '<circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/>',
     refresh: '<path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>',
     map: '<path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
+    leave: '<path d="M21 12a9 9 0 1 1-9-9"/><path d="M12 7v5l3 2"/><path d="M16 3h5v5M21 3l-5 5"/>',
   };
   function icon(name) {
     const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -263,6 +264,9 @@
     const history = h('div', {}, h('div', { class: 'skeleton' }), h('div', { class: 'skeleton' }));
     let busy = false;
     let records = [];
+    const leaveBox = h('div', { class: 'card mt' });
+    let leaves = null;
+    let leaveBusy = false;
 
     const menuList = h('div', { class: 'menu-list', hidden: true },
       h('button', { type: 'button', onclick: () => { menuList.hidden = true; changeOwnPassword(); } }, icon('key'), 'تغيير كلمة المرور'),
@@ -323,6 +327,104 @@
       }
     }
 
+    // ----- المغادرة -----
+    function leavePill(l) {
+      return {
+        pending: h('span', { class: 'pill open' }, 'بانتظار الموافقة'),
+        upcoming: h('span', { class: 'pill in' }, 'مقبولة'),
+        out: h('span', { class: 'pill open' }, 'جارية'),
+        returned: h('span', { class: 'pill out' }, `رجعت ${fmtTime(l.returned_at)}`),
+        rejected: h('span', { class: 'pill off' }, 'مرفوضة'),
+        cancelled: h('span', { class: 'pill out' }, 'ملغاة'),
+      }[l.phase];
+    }
+
+    function renderLeaves() {
+      const headRow = h('div', { class: 'card-head' }, h('h3', { class: 'card-title' }, 'المغادرة'),
+        h('button', { class: 'btn ghost sm', type: 'button', onclick: requestLeave }, icon('plus'), 'طلب مغادرة'));
+      if (!leaves) return leaveBox.replaceChildren(headRow, h('div', { class: 'skeleton' }));
+      const active = leaves.find((l) => l.phase === 'out');
+      const late = active && now() > new Date(active.ends_at);
+      leaveBox.replaceChildren(...[headRow,
+        active ? h('div', { class: 'leave-now' + (late ? ' late' : '') },
+          h('div', {}, h('b', {}, 'أنت في مغادرة الآن'), h('div', { class: 'small' }, `من ${fmtTime(active.starts_at)} حتى ${fmtTime(active.ends_at)}`),
+            late ? h('div', { class: 'small' }, 'انتهى وقت المغادرة — سجّل عودتك الآن') : null),
+          h('button', { class: 'btn return-btn', type: 'button', disabled: !!leaveBusy, onclick: () => endLeave(active) },
+            leaveBusy ? h('span', { class: 'spinner' }) : icon('in'), leaveBusy || 'انتهت المغادرة — رجعت')) : null,
+        leaves.length ? h('div', {}, leaves.slice(0, 5).map((l) => {
+          const d = new Date(l.starts_at);
+          const canCancel = l.phase === 'pending' || l.phase === 'upcoming';
+          return h('div', { class: 'history-item' },
+            h('div', { class: 'history-date' }, h('b', {}, F.day.format(d)), h('span', {}, F.weekday.format(d))),
+            h('div', { class: 'grow' }, h('div', {}, h('b', {}, `${fmtTime(l.starts_at)} – ${fmtTime(l.ends_at)}`)),
+              l.reason ? h('div', { class: 'small muted' }, l.reason) : null),
+            h('div', { class: 'leave-side' }, leavePill(l),
+              canCancel ? h('button', { class: 'link-btn', type: 'button', onclick: () => cancelLeave(l) }, 'إلغاء') : null));
+        })) : h('p', { class: 'small muted' }, 'إذا احتجت الخروج خلال الدوام، اطلب مغادرة وانتظر موافقة المدير.')].filter(Boolean));
+    }
+
+    async function loadLeaves() {
+      try { leaves = (await api('/api/my/leaves')).leaves; renderLeaves(); }
+      catch (e) { if (e.status !== 401) leaveBox.replaceChildren(msg('error', e.message)); }
+    }
+
+    function requestLeave() {
+      const t = now();
+      const hm = (d) => new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(d);
+      const start = new Date(Math.ceil(t / 300000) * 300000); // أقرب 5 دقائق قادمة
+      const date = h('input', { id: 'lv-date', type: 'date', required: true, value: today(), min: today(), max: addDays(today(), 30) });
+      const from = h('input', { id: 'lv-from', type: 'time', required: true, value: hm(start) });
+      const to = h('input', { id: 'lv-to', type: 'time', required: true, value: hm(new Date(+start + 3600e3)) });
+      const reason = h('input', { id: 'lv-reason', maxlength: 200, placeholder: 'مثال: مراجعة طبيب' });
+      openDialog({
+        title: 'طلب مغادرة',
+        submit: 'إرسال الطلب',
+        body: [
+          h('div', { class: 'field' }, h('label', { for: 'lv-date' }, 'اليوم'), date),
+          h('div', { class: 'form-grid' },
+            h('div', { class: 'field' }, h('label', { for: 'lv-from' }, 'من الساعة'), from),
+            h('div', { class: 'field' }, h('label', { for: 'lv-to' }, 'إلى الساعة'), to)),
+          h('div', { class: 'field' }, h('label', { for: 'lv-reason' }, 'السبب (اختياري)'), reason),
+          h('p', { class: 'small muted' }, 'يصل الطلب للمدير مباشرة، وتظهر موافقته هنا.'),
+        ],
+        onSubmit: async () => {
+          await api('/api/my/leaves', { method: 'POST', body: { date: date.value, from: from.value, to: to.value, reason: reason.value } });
+          toast('تم إرسال طلب المغادرة للمدير', 'ok');
+          await loadLeaves();
+        },
+      });
+    }
+
+    function cancelLeave(l) {
+      openDialog({
+        title: 'إلغاء طلب المغادرة',
+        submit: 'إلغاء الطلب', danger: true, cancel: 'رجوع',
+        body: h('p', {}, `مغادرة ${fmtDate(l.starts_at)} من ${fmtTime(l.starts_at)} حتى ${fmtTime(l.ends_at)}.`),
+        onSubmit: async () => {
+          await api(`/api/my/leaves/${l.id}/cancel`, { method: 'POST', body: {} });
+          toast('تم إلغاء الطلب', 'ok');
+          await loadLeaves();
+        },
+      });
+    }
+
+    async function endLeave(l) {
+      if (leaveBusy) return;
+      leaveBusy = 'جارٍ التسجيل…'; renderLeaves();
+      try {
+        const loc = await getLocation();
+        leaveBusy = 'جارٍ الحفظ…'; renderLeaves();
+        const r = await api(`/api/my/leaves/${l.id}/return`, { method: 'POST', body: loc });
+        toast(`أهلًا بعودتك — سُجّلت عودتك الساعة ${fmtTime(r.leave.returned_at)}`, 'ok');
+      } catch (e) {
+        if (e.status === 401) return;
+        toast(e.message, 'error');
+      } finally {
+        leaveBusy = false;
+        if (state.me) await loadLeaves();
+      }
+    }
+
     async function loadHistory() {
       try {
         records = (await api('/api/my/records')).records;
@@ -354,15 +456,20 @@
       h('div', { class: 'card clock-card' }, clockEl, dateEl, statusEl),
       actionEl,
       feedback,
+      leaveBox,
       h('div', { class: 'card mt' }, h('h3', { class: 'card-title' }, 'آخر تسجيلاتك'), history)));
-    tick(); render();
+    tick(); render(); renderLeaves();
     every(1000, tick);
+    // متابعة رد المدير على الطلب دون إعادة فتح التطبيق
+    every(30000, () => { if (document.visibilityState === 'visible' && !leaveBusy && !document.querySelector('dialog')) loadLeaves(); });
     loadHistory();
+    loadLeaves();
   }
 
   // ---------- لوحة الإدارة ----------
   const NAV = [
     ['home', 'اليوم', 'home'],
+    ['leaves', 'المغادرات', 'leave'],
     ['records', 'التقارير', 'report'],
     ['staff', 'الموظفون', 'users'],
     ['managers', 'المدراء', 'shield'],
@@ -373,7 +480,7 @@
     state.view = view;
     const u = state.me.user;
     const main = h('div', { class: 'admin-main' });
-    const navBtn = ([id, label, ic]) => h('button', { type: 'button', 'aria-current': id === view ? 'page' : null, onclick: () => showAdmin(id) }, icon(ic), label);
+    const navBtn = ([id, label, ic]) => h('button', { type: 'button', 'data-nav': id, 'aria-current': id === view ? 'page' : null, onclick: () => showAdmin(id) }, icon(ic), label);
     const menuList = h('div', { class: 'menu-list', hidden: true },
       h('button', { type: 'button', onclick: () => { menuList.hidden = true; changeOwnPassword(); } }, icon('key'), 'تغيير كلمة المرور'),
       h('button', { type: 'button', onclick: logout }, icon('out'), 'تسجيل الخروج'));
@@ -399,8 +506,13 @@
       state.skew = new Date(ov.server_now) - Date.now();
       state.companies = ov.companies;
       state.accWarn = ov.accuracy_warn_m;
+      // عدد طلبات المغادرة المنتظرة على زر «المغادرات»
+      document.querySelectorAll('[data-nav="leaves"]').forEach((b) => {
+        b.querySelector('.nav-badge')?.remove();
+        if (ov.pending_leaves) b.append(h('span', { class: 'nav-badge' }, ov.pending_leaves));
+      });
       main.replaceChildren();
-      ({ home: viewHome, records: viewRecords, staff: viewStaff, managers: viewManagers, settings: viewSettings })[view](main, ov);
+      ({ home: viewHome, leaves: viewLeaves, records: viewRecords, staff: viewStaff, managers: viewManagers, settings: viewSettings })[view](main, ov);
     } catch (e) {
       if (e.status !== 401) main.replaceChildren(msg('error', e.message,
         h('div', {}, h('button', { class: 'btn sm mt', onclick: () => showAdmin(view) }, icon('refresh'), 'إعادة المحاولة'))));
@@ -441,9 +553,13 @@
     const pct = (a, b) => (b ? Math.round((a / b) * 100) : 0);
     const durEls = [];
 
+    const onLeave = new Map(ov.on_leave.map((l) => [l.user_id, l]));
     main.append(...[
       installBanner(),
       notifyBanner(),
+      ov.pending_leaves ? h('div', { class: 'install leave-alert' }, icon('leave'),
+        h('div', { class: 'txt' }, h('b', {}, `${ov.pending_leaves === 1 ? 'طلب مغادرة' : `${ov.pending_leaves} طلبات مغادرة`} بانتظار موافقتك`)),
+        h('button', { class: 'btn sm', type: 'button', onclick: () => showAdmin('leaves') }, 'عرض')) : null,
       head('لوحة اليوم', F.date.format(now()), h('button', { class: 'btn ghost sm', onclick: () => showAdmin('home') }, icon('refresh'), 'تحديث')),
       h('div', { class: 'kpis' },
         h('div', { class: 'card kpi hero' }, h('span', { class: 'ic' }, icon('users')),
@@ -463,7 +579,9 @@
           return h('li', { class: 'person' }, avatar(e.full_name, e.company_id),
             h('div', { class: 'grow' }, h('div', { class: 'name' }, e.full_name),
               h('div', { class: 'meta' }, companyTag(e.company_id), h('span', {}, `دخل ${fmtTime(o.check_in_at)}`))),
-            h('div', { class: 'side' }, h('span', { class: 'pill in' }, dur), locLink(o.in_lat, o.in_lng, o.in_accuracy, o.in_place)));
+            h('div', { class: 'side' },
+              onLeave.has(e.id) ? h('span', { class: 'pill open', title: `مغادرة حتى ${fmtTime(onLeave.get(e.id).ends_at)}` }, `في مغادرة حتى ${fmtTime(onLeave.get(e.id).ends_at)}`) : null,
+              h('span', { class: 'pill in' }, dur), locLink(o.in_lat, o.in_lng, o.in_accuracy, o.in_place)));
         })) : h('div', { class: 'empty' }, icon('clock'), h('div', {}, 'لا يوجد أحد في الدوام حاليًا'))),
       h('div', { class: 'card' }, h('h3', { class: 'card-title' }, `خارج الدوام (${absent.length})`),
         absent.length ? h('ul', { class: 'people' }, absent.map((e) => h('li', { class: 'person' }, avatar(e.full_name, e.company_id),
@@ -473,6 +591,71 @@
       h('p', { class: 'small muted' }, 'المواقع تقريبية حسب أجهزة الموظفين؛ الدقة موضّحة بجانب كل موقع.')].filter(Boolean));
     every(30000, () => durEls.forEach(([el, t]) => { el.textContent = fmtDuration(minutesSince(t)); }));
     every(60000, () => { if (document.visibilityState === 'visible' && state.view === 'home' && !document.querySelector('dialog')) showAdmin('home'); });
+  }
+
+  // --- المغادرات ---
+  let leaveFilter = null; // null = حسب وجود طلبات منتظرة
+  function viewLeaves(main, ov) {
+    if (leaveFilter == null) leaveFilter = ov.pending_leaves ? 'pending' : '';
+    const list = h('div', {}, h('div', { class: 'card' }, h('div', { class: 'skeleton' }), h('div', { class: 'skeleton' })));
+    const seg = h('div', { class: 'seg' }, [['pending', `بانتظار الموافقة${ov.pending_leaves ? ` (${ov.pending_leaves})` : ''}`], ['approved', 'المقبولة'], ['', 'الكل']].map(([v, l]) =>
+      h('button', { type: 'button', 'aria-pressed': String(leaveFilter === v), onclick: () => { leaveFilter = v; showAdmin('leaves'); } }, l)));
+    main.append(head('المغادرات', 'طلبات الخروج خلال الدوام وتسجيل العودة'), h('div', { class: 'toolbar' }, seg), list);
+
+    const decide = async (l, approve, btn) => {
+      btn.disabled = true;
+      try {
+        await api(`/api/admin/leaves/${l.id}/decision`, { method: 'POST', body: { approve } });
+        toast(approve ? `تم قبول مغادرة ${l.employee_name}` : `تم رفض مغادرة ${l.employee_name}`, approve ? 'ok' : '');
+      } catch (e) { if (e.status !== 401) toast(e.message, 'error'); }
+      showAdmin('leaves');
+    };
+
+    (async () => {
+      try {
+        const { leaves } = await api('/api/admin/leaves' + (leaveFilter ? `?status=${leaveFilter}` : ''));
+        if (!leaves.length) {
+          return list.replaceChildren(h('div', { class: 'card empty' }, icon('leave'),
+            h('div', {}, leaveFilter === 'pending' ? 'لا توجد طلبات بانتظار موافقتك' : 'لا توجد مغادرات')));
+        }
+        list.replaceChildren(h('div', { class: 'leave-list' }, leaves.map((l) => {
+          const late = l.phase === 'out' && now() > new Date(l.ends_at);
+          const pill = {
+            pending: h('span', { class: 'pill open' }, 'بانتظار الموافقة'),
+            upcoming: h('span', { class: 'pill in' }, 'مقبولة · لم تبدأ'),
+            out: late ? h('span', { class: 'pill off' }, 'تأخر في العودة') : h('span', { class: 'pill open' }, 'في مغادرة الآن'),
+            returned: h('span', { class: 'pill done' }, 'رجع'),
+            rejected: h('span', { class: 'pill off' }, 'مرفوضة'),
+            cancelled: h('span', { class: 'pill out' }, 'ألغاها الموظف'),
+          }[l.phase];
+          let footer = null;
+          if (l.phase === 'pending') {
+            const yes = h('button', { class: 'btn sm', type: 'button', onclick: () => decide(l, true, yes) }, icon('check'), 'قبول');
+            const no = h('button', { class: 'btn sm danger', type: 'button', onclick: () => decide(l, false, no) }, icon('x'), 'رفض');
+            footer = h('div', { class: 'actions' }, yes, no);
+          } else if (l.phase === 'returned') {
+            footer = h('div', { class: 'leave-return' },
+              h('span', {}, `رجع الساعة ${fmtTime(l.returned_at)} · استغرقت ${fmtDuration(l.used_minutes)}`),
+              locLink(l.ret_lat, l.ret_lng, l.ret_accuracy, l.ret_place));
+          } else if (l.phase === 'out') {
+            footer = h('div', { class: 'leave-return small' + (late ? ' late' : '') },
+              late ? `انتهى وقت المغادرة الساعة ${fmtTime(l.ends_at)} ولم يسجّل عودته بعد` : 'لم يسجّل عودته بعد');
+          }
+          return h('div', { class: 'staff-card leave-item' },
+            h('div', { class: 'head' }, avatar(l.employee_name, l.company_id),
+              h('div', { class: 'grow' }, h('div', { class: 'name' }, h('b', {}, l.employee_name)), h('div', { class: 'small' }, companyTag(l.company_id))),
+              pill),
+            h('div', { class: 'leave-when' }, icon('clock'),
+              h('b', {}, `${fmtDate(l.starts_at)} · ${fmtTime(l.starts_at)} – ${fmtTime(l.ends_at)}`),
+              h('span', { class: 'muted' }, `(${fmtDuration(l.planned_minutes)})`)),
+            l.reason ? h('div', { class: 'small' }, h('span', { class: 'muted' }, 'السبب: '), l.reason) : null,
+            l.decided_by_name && l.phase !== 'cancelled' ? h('div', { class: 'small muted' }, `${l.status === 'rejected' ? 'رفضها' : 'وافق عليها'} ${l.decided_by_name}`) : null,
+            footer);
+        })));
+      } catch (e) {
+        if (e.status !== 401) list.replaceChildren(msg('error', e.message));
+      }
+    })();
   }
 
   // --- التقارير ---
@@ -871,6 +1054,21 @@
       toast(`${ev.kind === 'in' ? 'دخول' : 'خروج'}: ${ev.employee_name} — ${fmtTime(ev.at)}${where}`, ev.place && ev.place.place !== 'inside' ? 'error' : 'ok');
       // تحديث الصفحة الحالية إن لم يكن المدير وسط نافذة أو كتابة
       if (['home', 'records'].includes(state.view) && !document.querySelector('dialog') && !document.activeElement?.matches('input, select')) {
+        showAdmin(state.view);
+      }
+    });
+    live.addEventListener('leave', (e) => {
+      let ev;
+      try { ev = JSON.parse(e.data); } catch { return; }
+      const where = !ev.place ? '' : ev.place.place === 'inside' ? ' · في المكتب'
+        : ` · ${ev.place.place === 'outside' ? 'خارج المكتب' : 'غير مؤكد'} (${fmtDist(ev.place.distance_m)})`;
+      const text = {
+        request: `طلب مغادرة: ${ev.employee_name} — ${fmtTime(ev.starts_at)} إلى ${fmtTime(ev.ends_at)}`,
+        return: `انتهت المغادرة: ${ev.employee_name} — رجع ${fmtTime(ev.returned_at)}${where}`,
+        cancel: `ألغى ${ev.employee_name} طلب المغادرة`,
+      }[ev.kind];
+      if (text) toast(text, ev.place && ev.place.place !== 'inside' ? 'error' : 'ok');
+      if (['home', 'leaves'].includes(state.view) && !document.querySelector('dialog') && !document.activeElement?.matches('input, select')) {
         showAdmin(state.view);
       }
     });

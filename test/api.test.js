@@ -454,3 +454,82 @@ test('manager can permanently delete an employee and their records; managers can
   await assert.rejects(db.run('DELETE FROM attendance'), /cannot be deleted/);
   await assert.rejects(db.run("DELETE FROM users WHERE username = 'ahmad'"), /deactivate/);
 });
+
+test('leave requests: request → manager decides → employee returns with location (shown only to managers)', async () => {
+  let r = await call('POST', '/api/admin/users', { cookie: mgr, body: { full_name: 'ليلى', username: 'laila', password: 'laila-pass-1', company_id: 2 } });
+  const lailaId = r.json.id;
+  const emp = await login('laila', 'laila-pass-1');
+  const dateOf = (ms) => T.localDate(new Date(ms).toISOString());
+  const hm = (ms) => T.localDateTime(new Date(ms).toISOString()).slice(11);
+  const dayNow = dateOf(Date.now());
+
+  // تحقق من المدخلات
+  const bad = [
+    { date: dayNow, from: '10:00', to: '09:00' },
+    { date: '2020-01-01', from: '10:00', to: '11:00' },
+    { date: dayNow, from: '25:00', to: '26:00' },
+    { date: dayNow, from: '00:00', to: '00:01' }, // انتهى وقتها
+    { date: T.addDays(dayNow, 1), from: '06:00', to: '19:00' }, // أكثر من 12 ساعة
+  ];
+  for (const body of bad) assert.equal((await call('POST', '/api/my/leaves', { cookie: emp, body })).status, 400, JSON.stringify(body));
+  assert.equal((await call('POST', '/api/my/leaves', { cookie: mgr, body: { date: dayNow, from: '10:00', to: '11:00' } })).status, 403);
+
+  // مغادرة لغد ثم إلغاؤها
+  const tomorrow = T.addDays(dayNow, 1);
+  r = await call('POST', '/api/my/leaves', { cookie: emp, body: { date: tomorrow, from: '10:00', to: '12:00', reason: '  مراجعة   طبيب ' } });
+  assert.equal(r.status, 201);
+  assert.equal(r.json.leave.reason, 'مراجعة طبيب');
+  assert.equal(r.json.leave.status, 'pending');
+  assert.equal(r.json.leave.starts_at, T.localToUtc(tomorrow, '10:00').toISOString());
+  const futureId = r.json.leave.id;
+  assert.equal((await call('POST', '/api/my/leaves', { cookie: emp, body: { date: tomorrow, from: '11:00', to: '13:00' } })).status, 409, 'overlap');
+  assert.equal((await call('POST', `/api/my/leaves/${futureId}/return`, { cookie: emp, body: LOC })).status, 409, 'not approved yet');
+  assert.equal((await call('POST', `/api/my/leaves/${futureId}/cancel`, { cookie: emp, body: {} })).status, 200);
+  assert.equal((await call('POST', `/api/admin/leaves/${futureId}/decision`, { cookie: mgr, body: { approve: true } })).status, 409, 'cancelled cannot be decided');
+
+  // مغادرة بدأت قبل دقيقة وتنتهي بعد ساعتين — بإدخال مباشر لأن الطلب عبر الواجهة يحتاج وقتًا لم ينتهِ
+  await call('POST', '/api/admin/push/subscribe', { cookie: mgr, body: { endpoint: 'https://push.example.com/phone-3', keys: { p256dh: 'p'.repeat(20), auth: 'a'.repeat(10) } } });
+  const start = Date.now() - 60e3;
+  const startDay = dateOf(start);
+  pushed.length = 0;
+  r = await call('POST', '/api/my/leaves', { cookie: emp, body: { date: startDay, from: hm(start), to: hm(Math.min(start + 2 * 3600e3, T.localToUtc(startDay, '23:59').getTime())) } });
+  assert.equal(r.status, 201, r.text);
+  const id = r.json.leave.id;
+  await until(() => pushed.some((p) => p.title === 'طلب مغادرة: ليلى'));
+
+  let list = await call('GET', '/api/admin/leaves?status=pending', { cookie: mgr });
+  assert.ok(list.json.leaves.some((l) => l.id === id && l.employee_name === 'ليلى'));
+  assert.equal((await call('GET', '/api/admin/overview', { cookie: mgr })).json.pending_leaves, 1);
+  assert.equal((await call('POST', `/api/admin/leaves/${id}/decision`, { cookie: emp, body: { approve: true } })).status, 403);
+  assert.equal((await call('POST', `/api/admin/leaves/${id}/decision`, { cookie: mgr, body: { approve: 'yes' } })).status, 400);
+  assert.equal((await call('POST', `/api/admin/leaves/${id}/decision`, { cookie: mgr, body: { approve: true } })).status, 200);
+  assert.equal((await call('POST', `/api/admin/leaves/${id}/decision`, { cookie: mgr, body: { approve: false } })).status, 409, 'decided once');
+
+  let mine = await call('GET', '/api/my/leaves', { cookie: emp });
+  assert.equal(mine.json.leaves.find((l) => l.id === id).phase, 'out');
+  const ov = await call('GET', '/api/admin/overview', { cookie: mgr });
+  assert.ok(ov.json.on_leave.some((l) => l.user_id === lailaId));
+
+  // العودة: تحتاج الموقع، ومرة واحدة فقط
+  assert.equal((await call('POST', `/api/my/leaves/${id}/return`, { cookie: emp, body: {} })).status, 400);
+  pushed.length = 0;
+  r = await call('POST', `/api/my/leaves/${id}/return`, { cookie: emp, body: LOC });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.leave.phase, 'returned');
+  assert.deepEqual(Object.keys(r.json.leave).sort(), ['ends_at', 'id', 'phase', 'reason', 'returned_at', 'starts_at', 'status'], 'no location for the employee');
+  assert.equal((await call('POST', `/api/my/leaves/${id}/return`, { cookie: emp, body: LOC })).status, 409);
+  await until(() => pushed.some((p) => p.title === 'انتهت المغادرة: ليلى'));
+  assert.match(pushed.find((p) => p.title === 'انتهت المغادرة: ليلى').body, /^رجع .* · خارج المكتب \(\d+\.\d كم\) · استغرقت \d+ د من/);
+
+  list = await call('GET', `/api/admin/leaves?employee=${lailaId}`, { cookie: mgr });
+  const done = list.json.leaves.find((l) => l.id === id);
+  assert.equal(done.phase, 'returned');
+  assert.equal(done.ret_place.place, 'outside');
+  assert.equal(done.decided_by_name, 'علي عودة');
+  assert.ok(done.used_minutes >= 1 && done.used_minutes < done.planned_minutes);
+  assert.equal(list.json.leaves.find((l) => l.id === futureId).status, 'cancelled');
+
+  // حذف الموظف يحذف مغادراته أيضًا
+  assert.equal((await call('DELETE', `/api/admin/users/${lailaId}`, { cookie: mgr, body: {} })).status, 200);
+  assert.equal((await db.get('SELECT COUNT(*) n FROM leave_requests WHERE user_id = ?', lailaId)).n, 0);
+});

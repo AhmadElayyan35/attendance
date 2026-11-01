@@ -78,6 +78,26 @@ function createApp(db, opts = {}) {
     insertUser: `INSERT INTO users (username, password_hash, full_name, role, company_id, created_at)
                             VALUES (?, ?, ?, ?, ?, ?)`,
     updatePassword: 'UPDATE users SET password_hash = ? WHERE id = ?',
+    // المغادرات
+    leaveById: 'SELECT * FROM leave_requests WHERE id = ?',
+    myLeaves: 'SELECT * FROM leave_requests WHERE user_id = ? ORDER BY starts_at DESC LIMIT 10',
+    leaveOverlap: `SELECT 1 FROM leave_requests WHERE user_id = ? AND status IN ('pending', 'approved')
+                   AND starts_at < ? AND COALESCE(returned_at, ends_at) > ? LIMIT 1`,
+    insertLeave: `INSERT INTO leave_requests (user_id, company_id, starts_at, ends_at, reason, created_at)
+                  VALUES (?, ?, ?, ?, ?, ?)`,
+    cancelLeave: `UPDATE leave_requests SET status = 'cancelled'
+                  WHERE id = ? AND user_id = ? AND (status = 'pending' OR (status = 'approved' AND starts_at > ?))`,
+    returnLeave: `UPDATE leave_requests SET returned_at = ?, ret_lat = ?, ret_lng = ?, ret_accuracy = ?
+                  WHERE id = ? AND user_id = ? AND status = 'approved' AND returned_at IS NULL AND starts_at <= ?`,
+    decideLeave: `UPDATE leave_requests SET status = ?, decided_by = ?, decided_at = ? WHERE id = ? AND status = 'pending'`,
+    leavesFull: `
+      SELECT l.*, u.full_name AS employee_name, c.name AS company_name,
+             c.office_lat, c.office_lng, c.office_radius_m, d.full_name AS decided_by_name
+      FROM leave_requests l JOIN users u ON u.id = l.user_id JOIN companies c ON c.id = l.company_id
+      LEFT JOIN users d ON d.id = l.decided_by`,
+    pendingLeaves: "SELECT COUNT(*) AS n FROM leave_requests WHERE status = 'pending'",
+    onLeaveNow: `SELECT id, user_id, starts_at, ends_at FROM leave_requests
+                 WHERE status = 'approved' AND returned_at IS NULL AND starts_at <= ? AND starts_at >= ?`,
   };
 
   // ---------- أمان عام ----------
@@ -240,12 +260,63 @@ function createApp(db, opts = {}) {
     res.json({ records: (await db.all(q.myRecords, req.user.id, 10)).map(employeeView) });
   });
 
+  // ---------- المغادرة: طلب ← موافقة المدير ← تسجيل العودة ----------
+  app.get('/api/my/leaves', employee, async (req, res) => {
+    const nowIso = new Date().toISOString();
+    res.json({ leaves: (await db.all(q.myLeaves, req.user.id)).map((l) => employeeLeaveView(l, nowIso)) });
+  });
+
+  app.post('/api/my/leaves', employee, async (req, res) => {
+    const b = req.body || {};
+    const nowIso = new Date().toISOString();
+    const todayLocal = T.localDate(nowIso);
+    const date = String(b.date || '');
+    const starts = T.localToUtc(date, String(b.from || ''));
+    const ends = T.localToUtc(date, String(b.to || ''));
+    if (!starts || !ends) return fail(res, 400, 'اختر اليوم ووقت البداية والنهاية');
+    if (date < todayLocal || date > T.addDays(todayLocal, 30)) return fail(res, 400, 'يمكن طلب مغادرة لليوم أو خلال الثلاثين يومًا القادمة');
+    if (ends <= starts) return fail(res, 400, 'وقت النهاية يجب أن يكون بعد وقت البداية');
+    if (ends - starts > 12 * 3600e3) return fail(res, 400, 'المغادرة لا يمكن أن تزيد عن 12 ساعة');
+    if (ends.toISOString() <= nowIso) return fail(res, 400, 'وقت المغادرة انتهى بالفعل');
+    const reason = String(b.reason ?? '').trim().replace(/\s+/g, ' ');
+    if (reason.length > 200) return fail(res, 400, 'السبب طويل جدًا (حتى 200 حرف)');
+    const s = starts.toISOString(), e = ends.toISOString();
+    if (await db.get(q.leaveOverlap, req.user.id, e, s)) return fail(res, 409, 'لديك طلب مغادرة آخر في الوقت نفسه');
+    const r = await db.run(q.insertLeave, req.user.id, req.user.company_id, s, e, reason || null, nowIso);
+    const row = await db.get(q.leaveById, r.lastInsertRowid);
+    announceLeave('request', req.user, row);
+    res.status(201).json({ ok: true, leave: employeeLeaveView(row, nowIso) });
+  });
+
+  app.post('/api/my/leaves/:id/cancel', employee, async (req, res) => {
+    const r = await db.run(q.cancelLeave, Number(req.params.id), req.user.id, new Date().toISOString());
+    if (r.changes !== 1) return fail(res, 409, 'لا يمكن إلغاء هذا الطلب');
+    announceLeave('cancel', req.user, await db.get(q.leaveById, Number(req.params.id)));
+    res.json({ ok: true });
+  });
+
+  app.post('/api/my/leaves/:id/return', employee, async (req, res) => {
+    const loc = parseLocation(req.body);
+    if (loc.error) return fail(res, 400, loc.error);
+    const id = Number(req.params.id);
+    const nowIso = new Date().toISOString(); // وقت الخادم هو المرجع
+    const r = await db.run(q.returnLeave, nowIso, loc.lat, loc.lng, loc.accuracy, id, req.user.id, nowIso);
+    if (r.changes !== 1) return fail(res, 409, 'لا توجد مغادرة جارية لإنهائها');
+    const row = await db.get(q.leaveById, id);
+    announceLeave('return', req.user, row);
+    res.json({ ok: true, leave: employeeLeaveView(row, nowIso) });
+  });
+
   // ---------- الإدارة ----------
   const manager = requireRole('manager');
 
   app.get('/api/admin/overview', manager, async (req, res) => {
     const employees = (await db.all(q.employees)).map(shapeEmployee);
+    const nowIso = new Date().toISOString();
+    const dayStart = T.localMidnightToUtc(T.localDate(nowIso)).toISOString();
     res.json({
+      pending_leaves: (await db.get(q.pendingLeaves)).n,
+      on_leave: await db.all(q.onLeaveNow, nowIso, dayStart),
       companies: await db.all(q.companiesFull),
       employees,
       managers: (await db.all(q.managers)).map((m) => ({ ...m, active: !!m.active })),
@@ -261,6 +332,41 @@ function createApp(db, opts = {}) {
     if (f.error) return fail(res, 400, f.error);
     const records = await queryRecords(f);
     res.json({ records, totals: totalsByEmployee(records), truncated: records.length >= MAX_ROWS });
+  });
+
+  // المغادرات: ?status=pending|approved|rejected|cancelled و ?from/&to (حسب يوم المغادرة) و ?employee
+  app.get('/api/admin/leaves', manager, async (req, res) => {
+    const where = [];
+    const vals = [];
+    const status = String(req.query.status || '');
+    if (status) {
+      if (!['pending', 'approved', 'rejected', 'cancelled'].includes(status)) return fail(res, 400, 'حالة غير صحيحة');
+      where.push('l.status = ?'); vals.push(status);
+    }
+    for (const [key, op, shift] of [['from', '>=', 0], ['to', '<', 1]]) {
+      if (!req.query[key]) continue;
+      const d = /^\d{4}-\d{2}-\d{2}$/.test(req.query[key]) ? T.localMidnightToUtc(T.addDays(req.query[key], shift)) : null;
+      if (!d) return fail(res, 400, 'تاريخ غير صحيح');
+      where.push(`l.starts_at ${op} ?`); vals.push(d.toISOString());
+    }
+    if (req.query.employee) { where.push('l.user_id = ?'); vals.push(Number(req.query.employee)); }
+    const rows = await db.all(`${q.leavesFull} ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+      ORDER BY l.status = 'pending' DESC, l.starts_at DESC LIMIT 500`, ...vals);
+    const nowIso = new Date().toISOString();
+    res.json({ leaves: rows.map((l) => shapeLeave(l, nowIso)) });
+  });
+
+  app.post('/api/admin/leaves/:id/decision', manager, async (req, res) => {
+    const approve = req.body?.approve;
+    if (typeof approve !== 'boolean') return fail(res, 400, 'اختر قبول أو رفض');
+    const id = Number(req.params.id);
+    const r = await db.run(q.decideLeave, approve ? 'approved' : 'rejected', req.user.id, new Date().toISOString(), id);
+    if (r.changes !== 1) {
+      return (await db.get(q.leaveById, id)) ? fail(res, 409, 'تم البت في هذا الطلب مسبقًا') : fail(res, 404, 'الطلب غير موجود');
+    }
+    const row = await db.get(q.leaveById, id);
+    announceLeave(approve ? 'approved' : 'rejected', await db.get(q.userById, row.user_id), row);
+    res.json({ ok: true });
   });
 
   app.get('/api/admin/records.xlsx', manager, async (req, res, next) => {
@@ -444,6 +550,38 @@ function createApp(db, opts = {}) {
     })().catch((e) => console.error('announce failed:', e.message));
   }
 
+  // أحداث المغادرة: كل الأحداث تحدّث شاشات المدراء، والطلب الجديد والعودة يصلان كإشعار على الهاتف.
+  function announceLeave(kind, user, row) {
+    (async () => {
+      const company = await db.get(q.companyOffice, row.company_id);
+      const office = company?.office_lat == null ? null
+        : { lat: company.office_lat, lng: company.office_lng, radius: company.office_radius_m };
+      const place = kind === 'return' ? classifyPlace(row.ret_lat, row.ret_lng, row.ret_accuracy, office) : null;
+      const event = {
+        type: 'leave', kind, leave_id: row.id, user_id: user.id, employee_name: user.full_name,
+        starts_at: row.starts_at, ends_at: row.ends_at, returned_at: row.returned_at, place,
+      };
+      const line = `event: leave\ndata: ${JSON.stringify(event)}\n\n`;
+      for (const c of liveClients) c.res.write(line);
+
+      if (!push || !['request', 'return'].includes(kind)) return;
+      const day = T.localDate(row.starts_at) === T.localDate(new Date().toISOString()) ? 'اليوم' : T.localDate(row.starts_at);
+      const planned = T.durationMinutes(row.starts_at, row.ends_at);
+      let title, body;
+      if (kind === 'request') {
+        title = `طلب مغادرة: ${user.full_name}`;
+        body = [`${day} ${T.localTime(row.starts_at)} – ${T.localTime(row.ends_at)}`, `(${T.formatDuration(planned)})`, row.reason].filter(Boolean).join(' · ');
+      } else {
+        const placeText = !place ? '' : place.place === 'inside' ? 'في المكتب'
+          : `${place.place === 'outside' ? 'خارج المكتب' : 'موقع غير مؤكد'} (${fmtDistance(place.distance_m)})`;
+        title = `انتهت المغادرة: ${user.full_name}`;
+        body = [`رجع ${T.localTime(row.returned_at)}`, placeText,
+          `استغرقت ${T.formatDuration(T.durationMinutes(row.starts_at, row.returned_at))} من ${T.formatDuration(planned)}`].filter(Boolean).join(' · ');
+      }
+      await sendPush(await db.all(q.managerSubs), { title, body, tag: `leave-${row.id}-${kind}`, url: '/' });
+    })().catch((e) => console.error('announceLeave failed:', e.message));
+  }
+
   async function sendPush(subs, payload) {
     let sent = 0;
     await Promise.all(subs.map(async (s) => {
@@ -603,6 +741,34 @@ function employeeView(r) {
     check_in_at: r.check_in_at,
     check_out_at: r.check_out_at,
     status: r.check_out_at != null ? 'completed' : 'open',
+  };
+}
+
+// مرحلة المغادرة المقبولة: لم تبدأ / جارية (خارج حتى يسجّل عودته) / انتهت بعودته.
+function leavePhase(l, nowIso) {
+  if (l.status !== 'approved') return l.status;
+  if (l.returned_at) return 'returned';
+  return l.starts_at > nowIso ? 'upcoming' : 'out';
+}
+
+// ما يراه المدير عن المغادرة، مع تقدير مكان العودة.
+function shapeLeave(l, nowIso) {
+  return {
+    id: l.id, user_id: l.user_id, employee_name: l.employee_name, company_id: l.company_id, company_name: l.company_name,
+    starts_at: l.starts_at, ends_at: l.ends_at, reason: l.reason, status: l.status, phase: leavePhase(l, nowIso),
+    created_at: l.created_at, decided_at: l.decided_at, decided_by_name: l.decided_by_name,
+    returned_at: l.returned_at, ret_lat: l.ret_lat, ret_lng: l.ret_lng, ret_accuracy: l.ret_accuracy,
+    ret_place: l.returned_at ? classifyPlace(l.ret_lat, l.ret_lng, l.ret_accuracy, officeOf(l)) : null,
+    planned_minutes: T.durationMinutes(l.starts_at, l.ends_at),
+    used_minutes: l.returned_at ? T.durationMinutes(l.starts_at, l.returned_at) : null,
+  };
+}
+
+// ما يراه الموظف عن مغادرته: الأوقات والحالة فقط، بدون الموقع.
+function employeeLeaveView(l, nowIso) {
+  return {
+    id: l.id, starts_at: l.starts_at, ends_at: l.ends_at, reason: l.reason,
+    status: l.status, phase: leavePhase(l, nowIso), returned_at: l.returned_at,
   };
 }
 
