@@ -678,7 +678,7 @@ function createApp(db, opts = {}) {
   // ملف Excel حقيقي: ورقة من اليمين لليسار بالأعمدة المهمة فقط، وورقة ثانية لمجموع ساعات كل موظف.
   async function sendXlsx(res, records) {
     const wb = new ExcelJS.Workbook();
-    wb.creator = 'نظام الحضور والانصراف';
+    wb.creator = 'نظام الحضور';
     const style = (ws) => {
       const head = ws.getRow(1);
       head.font = { bold: true, color: { argb: 'FFFFFFFF' } };

@@ -208,7 +208,7 @@
     const logos = h('div', { class: 'auth-logos' });
     mount(h('div', { class: 'auth' }, h('div', { class: 'auth-card' },
       logos,
-      h('h1', {}, 'نظام الحضور والانصراف'),
+      h('h1', {}, 'نظام الحضور'),
       h('p', { class: 'sub' }, 'سجّل دخولك لمتابعة دوامك'),
       h('form', { onsubmit: async (e) => {
         e.preventDefault();
@@ -522,7 +522,7 @@
     mount(h('div', { class: 'admin' },
       h('aside', { class: 'sidebar' },
         h('div', { class: 'logos' }, state.companies.map((c) => c.logo ? h('img', { src: `/logos/${c.logo}`, alt: c.name }) : null)),
-        h('div', { class: 'brand' }, 'نظام الحضور والانصراف', h('span', {}, 'لوحة الإدارة')),
+        h('div', { class: 'brand' }, 'نظام الحضور', h('span', {}, 'لوحة الإدارة')),
         h('nav', {}, NAV.map(navBtn)),
         h('div', { class: 'me' }, avatar(u.full_name), h('div', { class: 'grow small' }, h('div', {}, u.full_name), h('div', { class: 'muted' }, 'مدير')),
           h('button', { class: 'icon-btn', type: 'button', title: 'تغيير كلمة المرور', onclick: changeOwnPassword }, icon('key')),
