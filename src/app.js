@@ -6,6 +6,7 @@ const ExcelJS = require('exceljs');
 const { hashPassword, verifyPassword, DUMMY_HASH, validatePassword } = require('./passwords');
 const T = require('./time');
 const { classifyPlace } = require('./geo');
+const { deleteEmployee } = require('./db');
 
 const SESSION_DAYS = 30;
 const COOKIE = 'sid';
@@ -21,7 +22,7 @@ function createApp(db, opts = {}) {
   if (opts.trustProxy) app.set('trust proxy', opts.trustProxy);
 
   // يمرّر أخطاء المعالجات غير المتزامنة إلى معالج الأخطاء (Express 4 لا يفعل ذلك تلقائيًا).
-  for (const method of ['get', 'post', 'patch', 'use']) {
+  for (const method of ['get', 'post', 'patch', 'delete', 'use']) {
     const original = app[method].bind(app);
     app[method] = (...args) => {
       if (method === 'get' && args.length === 1) return original(...args); // app.get('setting')
@@ -268,7 +269,7 @@ function createApp(db, opts = {}) {
     try { await sendXlsx(res, await queryRecords(f)); } catch (e) { next(e); }
   });
 
-  // إضافة موظف أو مدير. الموظف يجب أن ينتمي لشركة؛ المدير يرى الشركتين.
+  // إضافة موظف أو مدير. الموظف يجب أن ينتمي لشركة؛ المدير يرى كل الشركات.
   app.post('/api/admin/users', manager, async (req, res) => {
     const b = req.body || {};
     const role = b.role === 'manager' ? 'manager' : 'employee';
@@ -328,6 +329,16 @@ function createApp(db, opts = {}) {
     if (b.active === false || (b.password !== undefined && id !== req.user.id)) await db.run(q.deleteUserSessions, id);
     if (b.active === false) for (const c of liveClients) if (c.userId === id) c.res.end();
     res.json({ ok: true });
+  });
+
+  // حذف موظف نهائيًا مع كل سجلات حضوره (لا يمكن التراجع). المدراء يُوقفون فقط.
+  app.delete('/api/admin/users/:id', manager, async (req, res) => {
+    const id = Number(req.params.id);
+    const target = Number.isInteger(id) ? await db.get(q.userById, id) : null;
+    if (!target) return fail(res, 404, 'الحساب غير موجود');
+    if (target.role !== 'employee') return fail(res, 400, 'لا يمكن حذف مدير؛ استخدم الإيقاف');
+    const r = await deleteEmployee(db, id);
+    res.json({ ok: true, deleted_records: r.records });
   });
 
   // اسم الشركة و/أو موقع مكتبها (مركز ونطاق بالمتر) لتقدير «داخل/خارج المكتب».

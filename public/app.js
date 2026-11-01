@@ -42,6 +42,7 @@
     download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/>',
     key: '<circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 9.3-9.3M17 6l3 3M14.5 8.5l2 2"/>',
     edit: '<path d="M17 3a2.85 2.85 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/>',
+    trash: '<path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6"/>',
     power: '<path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><path d="M12 2v10"/>',
     search: '<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>',
     eye: '<path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/>',
@@ -440,7 +441,7 @@
     const pct = (a, b) => (b ? Math.round((a / b) * 100) : 0);
     const durEls = [];
 
-    main.append(
+    main.append(...[
       installBanner(),
       notifyBanner(),
       head('لوحة اليوم', F.date.format(now()), h('button', { class: 'btn ghost sm', onclick: () => showAdmin('home') }, icon('refresh'), 'تحديث')),
@@ -469,7 +470,7 @@
           h('div', { class: 'grow' }, h('div', { class: 'name' }, e.full_name), h('div', { class: 'meta' }, companyTag(e.company_id))),
           h('div', { class: 'side small muted' }, e.last_activity_at ? `آخر تسجيل: ${fmtDate(e.last_activity_at)} ${fmtTime(e.last_activity_at)}` : 'لم يسجّل بعد'))))
           : h('div', { class: 'empty' }, 'الجميع في الدوام 👏')),
-      h('p', { class: 'small muted' }, 'المواقع تقريبية حسب أجهزة الموظفين؛ الدقة موضّحة بجانب كل موقع.'));
+      h('p', { class: 'small muted' }, 'المواقع تقريبية حسب أجهزة الموظفين؛ الدقة موضّحة بجانب كل موقع.')].filter(Boolean));
     every(30000, () => durEls.forEach(([el, t]) => { el.textContent = fmtDuration(minutesSince(t)); }));
     every(60000, () => { if (document.visibilityState === 'visible' && state.view === 'home' && !document.querySelector('dialog')) showAdmin('home'); });
   }
@@ -513,7 +514,7 @@
       head('التقارير', 'سجلات الحضور والساعات لكل موظف', csv),
       h('div', { class: 'card' },
         h('div', { class: 'row', }, seg([['today', 'اليوم'], ['yesterday', 'أمس'], ['week', 'آخر 7 أيام'], ['month', 'هذا الشهر'], ['lastmonth', 'الشهر الماضي']], 'preset', (p) => { applyPreset(p); rerender(); })),
-        h('div', { class: 'row mt' }, seg([['', 'كل الشركات'], ...ov.companies.map((c) => [c.id, c.name])], 'company', (c) => { filters.company = String(c); filters.employee = ''; rerender(); })),
+        ov.companies.length > 1 ? h('div', { class: 'row mt' }, seg([['', 'كل الشركات'], ...ov.companies.map((c) => [c.id, c.name])], 'company', (c) => { filters.company = String(c); filters.employee = ''; rerender(); })) : null,
         h('div', { class: 'filters mt' },
           h('div', {}, h('label', { for: 'f-from' }, 'من'), from),
           h('div', {}, h('label', { for: 'f-to' }, 'إلى'), to),
@@ -615,7 +616,8 @@
         h('div', { class: 'actions' },
           h('button', { class: 'btn ghost sm', type: 'button', onclick: () => editUser(e, ov) }, icon('edit'), 'تعديل'),
           h('button', { class: 'btn ghost sm', type: 'button', onclick: () => resetPassword(e) }, icon('key'), 'كلمة مرور'),
-          h('button', { class: `btn sm ${e.active ? 'danger' : 'ghost'}`, type: 'button', onclick: () => toggleActive(e, 'staff') }, icon('power'), e.active ? 'إيقاف' : 'تفعيل'))))
+          h('button', { class: `btn sm ${e.active ? 'danger' : 'ghost'}`, type: 'button', onclick: () => toggleActive(e, 'staff') }, icon('power'), e.active ? 'إيقاف' : 'تفعيل'),
+          h('button', { class: 'btn ghost sm danger-text', type: 'button', onclick: () => deleteEmployee(e) }, icon('trash'), 'حذف'))))
         : [h('div', { class: 'card empty' }, icon('users'), h('div', {}, ov.employees.length ? 'لا نتائج مطابقة' : 'لم تُضف أي موظف بعد'))]));
     }
 
@@ -623,7 +625,7 @@
       head('الموظفون', `${activeCount} موظف فعّال`, h('button', { class: 'btn', type: 'button', onclick: () => addUser('employee', ov) }, icon('plus'), 'إضافة موظف')),
       h('div', { class: 'toolbar' }, h('div', { class: 'search' }, icon('search'), search), segWrap),
       grid,
-      h('p', { class: 'small muted mt' }, 'إيقاف الحساب يمنع الدخول ويحتفظ بكل سجلاته.'));
+      h('p', { class: 'small muted mt' }, 'إيقاف الحساب يمنع الدخول ويحتفظ بكل سجلاته. الحذف يزيل الموظف وكل سجلاته نهائيًا.'));
     drawSeg(); draw();
   }
 
@@ -644,7 +646,7 @@
       submit: 'إضافة',
       body: [
         h('div', { class: 'field' }, h('label', { for: 'a-name' }, 'الاسم الكامل'), name),
-        isEmp ? h('div', { class: 'field' }, h('label', {}, 'الشركة'), picker) : msg('info', 'المدير يرى بيانات الشركتين ويستطيع إدارة الموظفين والمدراء.'),
+        isEmp ? h('div', { class: 'field' }, h('label', {}, 'الشركة'), picker) : msg('info', 'المدير يرى كل البيانات ويستطيع إدارة الموظفين والمدراء.'),
         h('div', { class: 'field mt' }, h('label', { for: 'a-user' }, 'اسم المستخدم'), user, h('div', { class: 'hint' }, 'بالإنجليزية بدون مسافات، مثل ahmad أو ahmad.k')),
         h('div', { class: 'field' }, h('label', { for: 'a-pass' }, 'كلمة المرور'),
           h('div', { class: 'input-action' }, pw, h('button', { class: 'btn ghost', type: 'button', onclick: () => { pw.value = genPassword(); } }, icon('refresh'), 'توليد')),
@@ -731,10 +733,28 @@
     });
   }
 
+  function deleteEmployee(e) {
+    const sure = h('input', { type: 'checkbox', id: 'del-sure', required: true });
+    openDialog({
+      title: 'حذف الموظف نهائيًا',
+      submit: 'حذف نهائي', danger: true,
+      body: [
+        msg('warn', `سيُحذف ${e.full_name} وكل سجلات حضوره وانصرافه، ولن تظهر في التقارير أو ملفات Excel. لا يمكن التراجع عن ذلك.`),
+        h('p', { class: 'small muted' }, 'إذا أردت فقط منعه من الدخول مع الاحتفاظ بسجلاته، استخدم «إيقاف» بدلًا من الحذف.'),
+        h('label', { class: 'check', for: 'del-sure' }, sure, ' أفهم أن الحذف نهائي'),
+      ],
+      onSubmit: async () => {
+        const r = await api(`/api/admin/users/${e.id}`, { method: 'DELETE', body: {} });
+        toast(`تم حذف ${e.full_name}${r.deleted_records ? ` و${r.deleted_records} سجل` : ''}`, 'ok');
+        showAdmin('staff');
+      },
+    });
+  }
+
   // --- المدراء ---
   function viewManagers(main, ov) {
     main.append(
-      head('المدراء', 'كل مدير يرى بيانات الشركتين ويدير الحسابات', h('button', { class: 'btn', type: 'button', onclick: () => addUser('manager', ov) }, icon('plus'), 'إضافة مدير')),
+      head('المدراء', 'كل مدير يرى كل البيانات ويدير الحسابات', h('button', { class: 'btn', type: 'button', onclick: () => addUser('manager', ov) }, icon('plus'), 'إضافة مدير')),
       h('div', { class: 'staff-grid' }, ov.managers.map((m) => {
         const self = m.id === ov.me_id;
         return h('div', { class: 'staff-card' + (m.active ? '' : ' inactive') },
@@ -751,8 +771,8 @@
 
   // --- الإعدادات ---
   function viewSettings(main, ov) {
-    main.append(head('الإعدادات', 'أسماء الشركات وحسابك'),
-      h('div', { class: 'card' }, h('h3', { class: 'card-title' }, 'الشركات'),
+    main.append(head('الإعدادات', 'اسم الشركة وموقع المكتب وحسابك'),
+      h('div', { class: 'card' }, h('h3', { class: 'card-title' }, 'اسم الشركة'),
         ov.companies.map((c) => {
           const inp = h('input', { value: c.name, maxlength: 80, 'aria-label': 'اسم الشركة' });
           return h('form', { class: 'row field one-line', onsubmit: async (ev) => {
@@ -962,7 +982,7 @@
 
   // ---------- تثبيت التطبيق على الهاتف ----------
   let installPrompt = null;
-  window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); installPrompt = e; document.querySelectorAll('.install').forEach((b) => b.replaceWith(installBanner())); });
+  window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); installPrompt = e; document.querySelectorAll('.install').forEach((b) => { const nb = installBanner(); if (nb) b.replaceWith(nb); }); });
   window.addEventListener('appinstalled', () => { document.querySelectorAll('.install').forEach((b) => b.remove()); });
   const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
   const isIos = () => /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);

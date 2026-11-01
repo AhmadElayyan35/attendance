@@ -62,6 +62,9 @@ a { color: var(--navy-2); }
 .btn.ghost:hover { background: #f7f9fc; }
 .btn.danger { background: #fff; color: var(--red); border-color: #f5c6c2; }
 .btn.danger:hover { background: var(--red-soft); }
+.btn.danger-text { color: var(--red); }
+.check { display: flex; align-items: center; gap: 8px; font-weight: 600; cursor: pointer; }
+.check input { width: 18px; height: 18px; accent-color: var(--red); }
 .btn.sm { min-height: 36px; padding: 0 12px; font-size: .88rem; border-radius: 10px; }
 .btn.block { width: 100%; }
 .btn:disabled { opacity: .5; cursor: not-allowed; }

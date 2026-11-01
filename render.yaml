@@ -18,9 +18,7 @@ services:
         value: "1"
       - key: ADMIN_NAME
         value: علي عودة
-      - key: COMPANY_1_NAME
-        value: شركة التيسير
-      - key: COMPANY_2_NAME
+      - key: COMPANY_NAME
         value: اتحاد مقاولين المياه
       - key: DATABASE_URL
         sync: false

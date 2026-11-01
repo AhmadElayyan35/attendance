@@ -6,6 +6,19 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { createClient } = require('@libsql/client');
 
+// مشغّلات منع الحذف: السجلات والحسابات لا تُحذف إلا عبر deleteEmployee (حذف نهائي يطلبه المدير صراحة).
+const DELETE_GUARDS = [
+  `CREATE TRIGGER IF NOT EXISTS attendance_delete_guard BEFORE DELETE ON attendance
+BEGIN
+  SELECT RAISE(ABORT, 'attendance: records cannot be deleted');
+END`,
+  // الحسابات تُعطَّل ولا تُحذف، حتى تبقى السجلات مرتبطة بأصحابها.
+  `CREATE TRIGGER IF NOT EXISTS users_delete_guard BEFORE DELETE ON users
+BEGIN
+  SELECT RAISE(ABORT, 'users: deactivate accounts instead of deleting them');
+END`,
+];
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS companies (
   id    INTEGER PRIMARY KEY,
@@ -78,16 +91,7 @@ BEGIN
      OR NEW.in_lng IS NOT OLD.in_lng OR NEW.in_accuracy IS NOT OLD.in_accuracy;
 END;
 
-CREATE TRIGGER IF NOT EXISTS attendance_delete_guard BEFORE DELETE ON attendance
-BEGIN
-  SELECT RAISE(ABORT, 'attendance: records cannot be deleted');
-END;
-
--- الحسابات تُعطَّل ولا تُحذف، حتى تبقى السجلات مرتبطة بأصحابها.
-CREATE TRIGGER IF NOT EXISTS users_delete_guard BEFORE DELETE ON users
-BEGIN
-  SELECT RAISE(ABORT, 'users: deactivate accounts instead of deleting them');
-END;
+${DELETE_GUARDS.join(';\n\n')};
 `;
 
 // ترحيلات مرقّمة. أضف أي تغيير مستقبلي في الجداول كعنصر جديد (قائمة جمل SQL) في آخر القائمة.
@@ -95,15 +99,13 @@ const MIGRATIONS = [
   // 1: شعار لكل شركة
   [
     'ALTER TABLE companies ADD COLUMN logo TEXT',
-    "UPDATE companies SET logo = 'company-' || id || '.png' WHERE id IN (1, 2) AND logo IS NULL",
+    "UPDATE companies SET logo = 'company-2.png' WHERE id = 2 AND logo IS NULL",
   ],
   // 2: موقع مكتب كل شركة ونطاقه بالمتر (لتقدير داخل/خارج المكتب)
   [
     'ALTER TABLE companies ADD COLUMN office_lat REAL',
     'ALTER TABLE companies ADD COLUMN office_lng REAL',
     'ALTER TABLE companies ADD COLUMN office_radius_m REAL',
-    // شركة التيسير — شويكة، طولكرم (مكتب ~150 م²)
-    'UPDATE companies SET office_lat = 32.3192253, office_lng = 35.0257683, office_radius_m = 50 WHERE id = 1 AND office_lat IS NULL',
     // اتحاد مقدمي خدمات المياه — البالوع، البيرة (مكتب ~140 م²)
     'UPDATE companies SET office_lat = 31.914379, office_lng = 35.209045, office_radius_m = 50 WHERE id = 2 AND office_lat IS NULL',
   ],
@@ -118,6 +120,19 @@ const MIGRATIONS = [
        created_at TEXT NOT NULL
      )`,
     'CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
+  ],
+  // 4: إزالة الشركة رقم 1 (شركة التيسير) وكل ما يخصها: موظفوها وجلساتهم وسجلاتهم.
+  // مشغّلات منع الحذف تُرفع مؤقتًا وتعود في آخر المعاملة نفسها.
+  [
+    'DROP TRIGGER IF EXISTS attendance_delete_guard',
+    'DROP TRIGGER IF EXISTS users_delete_guard',
+    "DELETE FROM attendance WHERE company_id = 1 OR user_id IN (SELECT id FROM users WHERE role = 'employee' AND company_id = 1)",
+    "DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE role = 'employee' AND company_id = 1)",
+    "DELETE FROM push_subscriptions WHERE user_id IN (SELECT id FROM users WHERE role = 'employee' AND company_id = 1)",
+    "DELETE FROM users WHERE role = 'employee' AND company_id = 1",
+    'UPDATE users SET company_id = NULL WHERE company_id = 1',
+    'DELETE FROM companies WHERE id = 1',
+    ...DELETE_GUARDS,
   ],
 ];
 
@@ -168,11 +183,25 @@ async function openDb(url, authToken) {
 
   const count = (await db.get('SELECT COUNT(*) AS n FROM companies')).n;
   if (count === 0) {
-    await db.run('INSERT INTO companies (name) VALUES (?)', process.env.COMPANY_1_NAME || 'شركة التيسير');
-    await db.run('INSERT INTO companies (name) VALUES (?)', process.env.COMPANY_2_NAME || 'اتحاد مقاولين المياه');
+    // رقم 2 ثابت: الشعار وموقع المكتب في الترحيلات مربوطان به
+    await db.run('INSERT INTO companies (id, name) VALUES (2, ?)', process.env.COMPANY_NAME || 'اتحاد مقاولين المياه');
   }
   await migrate(db);
   return db;
+}
+
+// حذف موظف نهائيًا مع كل سجلاته وجلساته — معاملة واحدة تعيد مشغّلات الحماية في آخرها.
+async function deleteEmployee(db, id) {
+  const r = await db.batch([
+    'DROP TRIGGER IF EXISTS attendance_delete_guard',
+    'DROP TRIGGER IF EXISTS users_delete_guard',
+    { sql: 'DELETE FROM attendance WHERE user_id = ?', args: [id] },
+    { sql: 'DELETE FROM sessions WHERE user_id = ?', args: [id] },
+    { sql: 'DELETE FROM push_subscriptions WHERE user_id = ?', args: [id] },
+    { sql: "DELETE FROM users WHERE id = ? AND role = 'employee'", args: [id] },
+    ...DELETE_GUARDS,
+  ]);
+  return { records: r[2].rowsAffected, deleted: r[5].rowsAffected };
 }
 
 // نسخة احتياطية يومية متسقة (VACUUM INTO) لقاعدة البيانات المحلية، مع الاحتفاظ بآخر `keep` نسخة.
@@ -187,4 +216,4 @@ async function backupDb(db, dir, keep = 14) {
   return file;
 }
 
-module.exports = { openDb, backupDb };
+module.exports = { openDb, backupDb, deleteEmployee };

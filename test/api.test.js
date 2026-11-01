@@ -27,6 +27,8 @@ const until = async (cond, ms = 2000) => { const t = Date.now(); while (!cond())
 
 test.before(async () => {
   db = await openDb(fileUrl(path.join(dir, 'test.db')));
+  // شركة ثانية للاختبار فقط، حتى تبقى حالات تعدد الشركات مغطاة
+  await db.run("INSERT INTO companies (id, name) VALUES (3, 'شركة تجريبية')");
   await db.run(`INSERT INTO users (username, password_hash, full_name, role, created_at) VALUES ('boss', ?, 'المدير', 'manager', ?)`,
     hashPassword('boss-pass-123'), new Date().toISOString());
   server = createApp(db, { push: fakePush }).listen(0);
@@ -86,8 +88,8 @@ test('permissions are enforced on the server', async () => {
   assert.equal((await call('GET', '/api/admin/overview', { cookie: emp1 })).status, 403);
   assert.equal((await call('GET', '/api/admin/records', { cookie: emp1 })).status, 403);
   assert.equal((await call('GET', '/api/admin/records.xlsx', { cookie: emp1 })).status, 403);
-  assert.equal((await call('POST', '/api/admin/users', { cookie: emp1, body: { full_name: 'x', username: 'xxx', password: 'pass-1234', company_id: 1 } })).status, 403);
-  assert.equal((await call('PATCH', `/api/admin/users/${emp1Id}`, { cookie: emp1, body: { company_id: 2 } })).status, 403);
+  assert.equal((await call('POST', '/api/admin/users', { cookie: emp1, body: { full_name: 'x', username: 'xxx', password: 'pass-1234', company_id: 2 } })).status, 403);
+  assert.equal((await call('PATCH', `/api/admin/users/${emp1Id}`, { cookie: emp1, body: { company_id: 3 } })).status, 403);
   assert.equal((await call('POST', '/api/my/check-in', { cookie: mgr, body: LOC })).status, 403, 'manager has no attendance');
   const forged = await call('POST', '/api/my/check-in', { cookie: emp1, body: LOC, headers: { Origin: 'https://evil.example' } });
   assert.equal(forged.status, 403, 'cross-origin POST blocked');
@@ -109,12 +111,12 @@ test('missing or invalid location saves nothing', async () => {
 
 test('check-in uses server time and own company; client cannot override', async () => {
   const before = Date.now();
-  const r = await call('POST', '/api/my/check-in', { cookie: emp1, body: { ...LOC, check_in_at: '2000-01-01T00:00:00.000Z', company_id: 2, user_id: emp2Id } });
+  const r = await call('POST', '/api/my/check-in', { cookie: emp1, body: { ...LOC, check_in_at: '2000-01-01T00:00:00.000Z', company_id: 3, user_id: emp2Id } });
   assert.equal(r.status, 201);
   const t = Date.parse(r.json.record.check_in_at);
   assert.ok(t >= before - 1000 && t <= Date.now() + 1000, 'server time used');
   assert.equal(r.json.record.user_id, emp1Id);
-  assert.equal(r.json.record.company_id, 1);
+  assert.equal(r.json.record.company_id, 2);
   assert.equal((await db.get('SELECT in_accuracy FROM attendance WHERE id = ?', r.json.record.id)).in_accuracy, 12.4, 'accuracy stored for the manager');
   assert.equal(r.json.record.status, 'open');
   const me = await call('GET', '/api/me', { cookie: emp1 });
@@ -155,7 +157,7 @@ test('database rejects edits, deletes and a second open record', async () => {
   await assert.rejects(db.run('DELETE FROM attendance WHERE id = ?', done.id), /cannot be deleted/);
   const open = (await db.get('SELECT * FROM attendance WHERE check_out_at IS NULL LIMIT 1'));
   await assert.rejects(db.run('UPDATE attendance SET check_in_at = ? WHERE id = ?', '2020-01-01T00:00:00.000Z', open.id), /immutable/);
-  const insert = 'INSERT INTO attendance (user_id, company_id, check_in_at, in_lat, in_lng, in_accuracy) VALUES (?, 1, ?, 1, 1, 1)';
+  const insert = 'INSERT INTO attendance (user_id, company_id, check_in_at, in_lat, in_lng, in_accuracy) VALUES (?, 2, ?, 1, 1, 1)';
   await assert.rejects(db.run(insert, open.user_id, new Date().toISOString()), /UNIQUE/);
   await assert.rejects(db.run(insert, emp2Id, new Date().toISOString()), /active employee of this company/, 'wrong company');
   await assert.rejects(db.run('DELETE FROM users WHERE id = ?', emp1Id), /deactivate/);
@@ -166,9 +168,9 @@ test('duration across midnight, Hebron dates, and totals exclude open records', 
   const ins = async (...a) => (await db.run('INSERT INTO attendance (user_id, company_id, check_in_at, in_lat, in_lng, in_accuracy) VALUES (?, ?, ?, 31.5, 35.1, 8)', ...a)).lastInsertRowid;
   const close = (...a) => db.run('UPDATE attendance SET check_out_at = ?, out_lat = 31.5, out_lng = 35.1, out_accuracy = 9 WHERE id = ?', ...a);
   // 2026-01-14 21:30 محليًا → 2026-01-15 02:15 محليًا = 4س 45د
-  const a = await ins(emp2Id, 2, '2026-01-14T19:30:00.000Z'); await close('2026-01-15T00:15:00.000Z', a);
+  const a = await ins(emp2Id, 3, '2026-01-14T19:30:00.000Z'); await close('2026-01-15T00:15:00.000Z', a);
   // 2026-01-15 00:30 محليًا (ما زال 14 يناير بتوقيت UTC) → 08:00 = 7س 30د
-  const b = await ins(emp2Id, 2, '2026-01-14T22:30:00.000Z'); await close('2026-01-15T06:00:00.000Z', b);
+  const b = await ins(emp2Id, 3, '2026-01-14T22:30:00.000Z'); await close('2026-01-15T06:00:00.000Z', b);
 
   assert.equal(T.durationMinutes('2026-01-14T19:30:00.000Z', '2026-01-15T00:15:00.000Z'), 285);
   assert.equal(T.localDate('2026-01-14T22:30:00.000Z'), '2026-01-15');
@@ -194,8 +196,8 @@ test('duration across midnight, Hebron dates, and totals exclude open records', 
   assert.equal(r.json.totals[0].completed_minutes, 0);
   assert.equal(r.json.totals[0].open_count, 1);
 
-  r = await call('GET', '/api/admin/records?company=1', { cookie: mgr });
-  assert.ok(r.json.records.every((x) => x.company_id === 1));
+  r = await call('GET', '/api/admin/records?company=2', { cookie: mgr });
+  assert.ok(r.json.records.every((x) => x.company_id === 2));
   assert.equal((await call('GET', '/api/admin/records?from=yesterday', { cookie: mgr })).status, 400);
 });
 
@@ -220,10 +222,10 @@ test('Excel export: RTL sheet with times and duration only, plus totals sheet', 
   assert.deepEqual(rows[0], ['الموظف', 'الشركة', 'التاريخ', 'وقت الدخول', 'وقت الخروج', 'مدة العمل', 'الحالة']);
   assert.equal(rows.length, 3);
   // دوام عبر منتصف الليل: 9:30 م → 2:15 ص في اليوم التالي = 4 س 45 د
-  assert.deepEqual(rows[2], ['سارة', 'اتحاد مقاولين المياه', '2026-01-14', '9:30 م', '2:15 ص (2026-01-15)', '4 س 45 د', 'مكتمل']);
+  assert.deepEqual(rows[2], ['سارة', 'شركة تجريبية', '2026-01-14', '9:30 م', '2:15 ص (2026-01-15)', '4 س 45 د', 'مكتمل']);
   const totals = [];
   wb.getWorksheet('مجموع الساعات').eachRow((row) => totals.push(row.values.slice(1)));
-  assert.deepEqual(totals[1], ['سارة', 'اتحاد مقاولين المياه', 2, '12 س 15 د']);
+  assert.deepEqual(totals[1], ['سارة', 'شركة تجريبية', 2, '12 س 15 د']);
 });
 
 test('employees see only times — no location, accuracy or durations', async () => {
@@ -249,7 +251,7 @@ test('multiple managers: add, both see everything, safe deactivation', async () 
   assert.equal(r.json.employees.length, 2);
   // لا يمكن إيقاف النفس، ولا ربط المدير بشركة
   assert.equal((await call('PATCH', `/api/admin/users/${boss2Id}`, { cookie: mgr2, body: { active: false } })).status, 400);
-  assert.equal((await call('PATCH', `/api/admin/users/${boss2Id}`, { cookie: mgr, body: { company_id: 1 } })).status, 400);
+  assert.equal((await call('PATCH', `/api/admin/users/${boss2Id}`, { cookie: mgr, body: { company_id: 2 } })).status, 400);
   // مدير يوقف الآخر → تنتهي جلسته
   assert.equal((await call('PATCH', `/api/admin/users/${boss2Id}`, { cookie: mgr, body: { active: false } })).status, 200);
   assert.equal((await call('GET', '/api/admin/overview', { cookie: mgr2 })).status, 401);
@@ -273,11 +275,11 @@ test('daily backup creates a readable copy and prunes old ones', async () => {
 });
 
 test('editing and disabling an employee keeps their records', async () => {
-  let r = await call('PATCH', `/api/admin/users/${emp2Id}`, { cookie: mgr, body: { full_name: 'سارة محمد', company_id: 1 } });
+  let r = await call('PATCH', `/api/admin/users/${emp2Id}`, { cookie: mgr, body: { full_name: 'سارة محمد', company_id: 2 } });
   assert.equal(r.status, 200);
   r = await call('GET', `/api/admin/records?employee=${emp2Id}&from=2026-01-14&to=2026-01-15`, { cookie: mgr });
   assert.equal(r.json.records[0].employee_name, 'سارة محمد');
-  assert.equal(r.json.records[0].company_name, 'اتحاد مقاولين المياه', 'old records keep the company at the time');
+  assert.equal(r.json.records[0].company_name, 'شركة تجريبية', 'old records keep the company at the time');
 
   r = await call('PATCH', `/api/admin/users/${emp2Id}`, { cookie: mgr, body: { active: false } });
   assert.equal(r.status, 200);
@@ -320,26 +322,26 @@ test('place estimate: inside / outside / uncertain', () => {
 });
 
 test('admin sees inside/outside per record; office location editable; hidden from others', async () => {
-  // سجل أحمد المفتوح كان من الخليل (LOC) بعيدًا عن مكتب التيسير
+  // سجل أحمد المفتوح كان من الخليل (LOC) بعيدًا عن مكتب اتحاد المياه
   let r = await call('GET', `/api/admin/records?employee=${emp1Id}`, { cookie: mgr });
   assert.equal(r.json.records[0].in_place.place, 'outside');
-  assert.ok(r.json.records[0].in_place.distance_m > 50000);
+  assert.ok(r.json.records[0].in_place.distance_m > 40000);
   let ov = await call('GET', '/api/admin/overview', { cookie: mgr });
-  const tayseer = ov.json.companies.find((c) => c.id === 1);
-  assert.equal(tayseer.office_lat, 32.3192253);
-  assert.equal(tayseer.office_radius_m, 50);
+  const water = ov.json.companies.find((c) => c.id === 2);
+  assert.equal(water.office_lat, 31.914379);
+  assert.equal(water.office_radius_m, 50);
   assert.equal(ov.json.employees.find((e) => e.id === emp1Id).open_record.in_place.place, 'outside');
 
-  // نقل مكتب التيسير إلى مكان التسجيل → يصبح «في المكتب»
-  assert.equal((await call('PATCH', '/api/admin/companies/1', { cookie: mgr, body: { office_lat: LOC.lat, office_lng: LOC.lng, office_radius_m: 50 } })).status, 200);
+  // نقل مكتب اتحاد المياه إلى مكان التسجيل → يصبح «في المكتب»
+  assert.equal((await call('PATCH', '/api/admin/companies/2', { cookie: mgr, body: { office_lat: LOC.lat, office_lng: LOC.lng, office_radius_m: 50 } })).status, 200);
   r = await call('GET', `/api/admin/records?employee=${emp1Id}`, { cookie: mgr });
   assert.equal(r.json.records[0].in_place.place, 'inside');
-  assert.equal((await call('PATCH', '/api/admin/companies/1', { cookie: mgr, body: { office_lat: 32.3192253, office_lng: 35.0257683, office_radius_m: 50 } })).status, 200);
+  assert.equal((await call('PATCH', '/api/admin/companies/2', { cookie: mgr, body: { office_lat: 31.914379, office_lng: 35.209045, office_radius_m: 50 } })).status, 200);
 
   // تحقق من المدخلات
-  assert.equal((await call('PATCH', '/api/admin/companies/1', { cookie: mgr, body: { office_lat: 32.3, office_lng: 35.0, office_radius_m: 5 } })).status, 400);
-  assert.equal((await call('PATCH', '/api/admin/companies/1', { cookie: mgr, body: { office_lat: 'x', office_lng: 35.0, office_radius_m: 50 } })).status, 400);
-  assert.equal((await call('PATCH', '/api/admin/companies/1', { cookie: emp1, body: { office_lat: 32.3, office_lng: 35.0, office_radius_m: 50 } })).status, 403);
+  assert.equal((await call('PATCH', '/api/admin/companies/2', { cookie: mgr, body: { office_lat: 32.3, office_lng: 35.0, office_radius_m: 5 } })).status, 400);
+  assert.equal((await call('PATCH', '/api/admin/companies/2', { cookie: mgr, body: { office_lat: 'x', office_lng: 35.0, office_radius_m: 50 } })).status, 400);
+  assert.equal((await call('PATCH', '/api/admin/companies/2', { cookie: emp1, body: { office_lat: 32.3, office_lng: 35.0, office_radius_m: 50 } })).status, 403);
 
   // صفحة الدخول والموظف لا يرون مواقع المكاتب ولا التقدير
   const pub = await call('GET', '/api/companies');
@@ -372,7 +374,7 @@ test('admin gets live events and phone notifications on check-in/out; can turn t
   await until(() => pushed.length >= 1 && streamText.includes('"kind":"out"'));
   const out = pushed.find((p) => p.title.startsWith('خروج'));
   assert.equal(out.title, 'خروج: أحمد');
-  assert.match(out.body, /شركة التيسير · .* · خارج المكتب \(\d+\.\d كم\) · مدة العمل/);
+  assert.match(out.body, /اتحاد مقاولين المياه · .* · خارج المكتب \(\d+\.\d كم\) · مدة العمل/);
   assert.equal(out.endpoint, 'https://push.example.com/phone-1');
   // الاشتراك المنتهي حُذف تلقائيًا
   let expiredLeft = 1;
@@ -404,4 +406,51 @@ test('admin gets live events and phone notifications on check-in/out; can turn t
 test('logout ends the session', async () => {
   await call('POST', '/api/logout', { cookie: emp1, body: {} });
   assert.equal((await call('GET', '/api/me', { cookie: emp1 })).status, 401);
+});
+
+test('older databases lose company 1 (Al-Tayseer) and everything tied to it', async () => {
+  const old = await openDb(fileUrl(path.join(dir, 'old.db')));
+  // نعيد القاعدة إلى ما قبل الترحيل 4، كما هي على الخادم الحالي
+  await old.run('UPDATE schema_version SET version = 3');
+  await old.run("INSERT INTO companies (id, name, logo) VALUES (1, 'شركة التيسير', 'company-1.png')");
+  const now = new Date().toISOString();
+  const u = await old.run("INSERT INTO users (username, password_hash, full_name, role, company_id, created_at) VALUES ('tay1', 'x', 'موظف التيسير', 'employee', 1, ?)", now);
+  const keep = await old.run("INSERT INTO users (username, password_hash, full_name, role, company_id, created_at) VALUES ('wat1', 'x', 'موظف المياه', 'employee', 2, ?)", now);
+  await old.run('INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)', 'tok', u.lastInsertRowid, now, now);
+  await old.run('INSERT INTO attendance (user_id, company_id, check_in_at, in_lat, in_lng, in_accuracy) VALUES (?, 1, ?, 32.3, 35.0, 5)', u.lastInsertRowid, now);
+  await old.run('INSERT INTO attendance (user_id, company_id, check_in_at, in_lat, in_lng, in_accuracy) VALUES (?, 2, ?, 31.9, 35.2, 5)', keep.lastInsertRowid, now);
+  old.close();
+
+  const db2 = await openDb(fileUrl(path.join(dir, 'old.db')));
+  assert.deepEqual((await db2.all('SELECT id, name FROM companies')).map((c) => c.id), [2]);
+  assert.deepEqual((await db2.all('SELECT username FROM users')).map((x) => x.username), ['wat1']);
+  assert.equal((await db2.get('SELECT COUNT(*) n FROM sessions')).n, 0);
+  assert.equal((await db2.get('SELECT COUNT(*) n FROM attendance')).n, 1);
+  // حماية منع الحذف عادت بعد الترحيل
+  await assert.rejects(db2.run('DELETE FROM attendance'), /cannot be deleted/);
+  await assert.rejects(db2.run('DELETE FROM users'), /deactivate/);
+  db2.close();
+});
+
+test('manager can permanently delete an employee and their records; managers cannot be deleted', async () => {
+  let r = await call('POST', '/api/admin/users', { cookie: mgr, body: { full_name: 'مؤقت', username: 'temp1', password: 'temp-pass-1', company_id: 2 } });
+  const id = r.json.id;
+  const tmp = await login('temp1', 'temp-pass-1');
+  assert.equal((await call('POST', '/api/my/check-in', { cookie: tmp, body: LOC })).status, 201);
+  assert.equal((await call('POST', '/api/my/check-out', { cookie: tmp, body: LOC })).status, 200);
+  assert.equal((await call('POST', '/api/my/check-in', { cookie: tmp, body: LOC })).status, 201);
+
+  assert.equal((await call('DELETE', `/api/admin/users/${id}`, { cookie: tmp, body: {} })).status, 403, 'employees cannot delete');
+  const bossId = (await db.get("SELECT id FROM users WHERE username = 'boss'")).id;
+  assert.equal((await call('DELETE', `/api/admin/users/${bossId}`, { cookie: mgr, body: {} })).status, 400, 'managers are deactivated, not deleted');
+  r = await call('DELETE', `/api/admin/users/${id}`, { cookie: mgr, body: {} });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.deleted_records, 2);
+  assert.equal((await db.get('SELECT COUNT(*) n FROM users WHERE id = ?', id)).n, 0);
+  assert.equal((await db.get('SELECT COUNT(*) n FROM attendance WHERE user_id = ?', id)).n, 0);
+  assert.equal((await call('GET', '/api/me', { cookie: tmp })).status, 401, 'session gone');
+  assert.equal((await call('DELETE', `/api/admin/users/${id}`, { cookie: mgr, body: {} })).status, 404);
+  // الحماية ما زالت تمنع أي حذف آخر مباشرة
+  await assert.rejects(db.run('DELETE FROM attendance'), /cannot be deleted/);
+  await assert.rejects(db.run("DELETE FROM users WHERE username = 'ahmad'"), /deactivate/);
 });
